@@ -31,16 +31,12 @@ jobs:
             data/dev/gold/_LAST_FAILED.json
   deploy:
     needs: test
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: self-hosted
     steps:
-      - name: Deploy to the always-on host over SSH (prod config)
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.HOST_USER }}
-          key: ${{ secrets.HOST_SSH_KEY }}
-          script: |
-            cd ~/AIS-Data-Pipeline-Project && git pull --ff-only
-            ~/spark-env/bin/pip install -r requirements.txt
-            sudo systemctl restart ais-collector ais-pipeline-loop
+      - name: Deploy on the always-on host (prod config)
+        run: |
+          cd ~/AIS-Data-Pipeline-Project
+          git pull --ff-only
+          ~/spark-env/bin/pip install -r requirements.txt
+          sudo systemctl restart ais-collector ais-pipeline-loop
