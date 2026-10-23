@@ -41,6 +41,6 @@ jobs:
           username: ${{ secrets.HOST_USER }}
           key: ${{ secrets.HOST_SSH_KEY }}
           script: |
-            cd ~/ais-pipeline && git pull --ff-only
-            .venv/bin/pip install -r requirements.txt
+            cd ~/AIS-Data-Pipeline-Project && git pull --ff-only
+            ~/spark-env/bin/pip install -r requirements.txt
             sudo systemctl restart ais-collector ais-pipeline-loop

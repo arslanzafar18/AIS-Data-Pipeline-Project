@@ -2,10 +2,11 @@
 Description=AIS collector (Bronze)
 After=network-online.target
 [Service]
-WorkingDirectory=/home/ubuntu/ais-pipeline
-EnvironmentFile=/home/ubuntu/ais-pipeline/.env
-Environment=PYTHONPATH=/home/ubuntu/ais-pipeline
-ExecStart=/home/ubuntu/ais-pipeline/.venv/bin/python -m collector.collector
+WorkingDirectory=/home/ubuntu/AIS-Data-Pipeline-Project
+EnvironmentFile=/home/ubuntu/AIS-Data-Pipeline-Project/.env
+Environment=PYTHONPATH=/home/ubuntu/AIS-Data-Pipeline-Project
+Environment=JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ExecStart=/home/ubuntu/spark-env/bin/python -m collector.collector
 Restart=always
 RestartSec=5
 [Install]
