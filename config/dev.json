@@ -1,0 +1,22 @@
+{
+  "env": "dev",
+  "data_root": "data/dev",
+  "metrics_dir": "metrics/dev",
+  "flush_seconds": 120,
+  "spark_master": "local[1]",
+  "shuffle_partitions": 4,
+  "facility_name_col": "fclName",
+  "facility_kind_col": "fclKind",
+  "near_m": 5000,
+  "at_m": 500,
+  "stationary_kn": 0.5,
+  "visit_gap_s": 1800,
+  "cross_batch_dedupe": true,
+  "max_files_per_trigger": 10,
+  "lookback_days": 2,
+  "gate": {
+    "min_silver_rows": 100,
+    "max_reject_rate": 0.20,
+    "max_silver_staleness_min": null
+  }
+}

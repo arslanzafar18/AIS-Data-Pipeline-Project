@@ -1,0 +1,15 @@
+name: monitor
+on:
+  schedule:
+    - cron: "*/10 * * * *"     # GitHub minimum interval is 5 min; runs can be delayed under load
+  workflow_dispatch:
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collector heartbeat and Gold readiness (a failure notifies the repo owner)
+        env:
+          HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+          GOLD_URL: ${{ secrets.GOLD_URL }}
+        run: python scripts/check_heartbeat.py

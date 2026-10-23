@@ -1,0 +1,13 @@
+      "detail": "5157 rows (min 100)"
+      "passed": false,
+      "detail": "0.34652605459057073 over 8060 input rows (max 0.2)"
+      "detail": "visits=2768 silver=2768"
+      "detail": "hourly=2768 silver=2768"
+      "detail": "visits=1334 hourly=1334 silver=1334"
+      "detail": "neg=0 nullkeys=0"
+Gold NOT published: quality checks failed
+gold_job exit code: 1
+--- previous published Gold is still READY:
+READY
+--- failure manifest:
+FAILED [{'check': 'silver_reject_rate_ok', 'passed': False, 'detail': '0.34652605459057073 over 8060 input rows (max 0.2)'}]

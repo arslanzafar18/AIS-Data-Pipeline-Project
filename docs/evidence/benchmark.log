@@ -1,0 +1,12 @@
+### scale 10
+positions: 51,570   installations: 300   pairs evaluated by naive join: 15,471,000
+A  join step: haversine on ALL pairs, then filter                 1.41 s   (result rows 8800)
+B  join step: bounding-box prefilter, then haversine              0.60 s   (result rows 8800)
+C  full enrich (join + nearest + left join), shuffle=4            1.30 s   (result rows 51570)
+C' full enrich with Spark default shuffle partitions (200)        1.67 s   (result rows 51570)
+### scale 60
+positions: 309,420   installations: 300   pairs evaluated by naive join: 92,826,000
+A  join step: haversine on ALL pairs, then filter                 4.92 s   (result rows 52800)
+B  join step: bounding-box prefilter, then haversine              0.77 s   (result rows 52800)
+C  full enrich (join + nearest + left join), shuffle=4            2.06 s   (result rows 309420)
+C' full enrich with Spark default shuffle partitions (200)        2.24 s   (result rows 309420)

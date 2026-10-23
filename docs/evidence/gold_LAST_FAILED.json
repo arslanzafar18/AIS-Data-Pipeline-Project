@@ -1,0 +1,45 @@
+{
+  "run_id": "bea33c41c2",
+  "env": "dev",
+  "finished_at": "2026-10-11T09:13:07.743117+00:00",
+  "silver_rows": 5157,
+  "silver_rows_before_dedupe": 5157,
+  "silver_max_event_ts": "2026-10-11 12:00:00",
+  "tables": {
+    "vessel_visits": 10,
+    "installation_activity_hourly": 6
+  },
+  "checks": [
+    {
+      "check": "silver_has_enough_rows",
+      "passed": true,
+      "detail": "5157 rows (min 100)"
+    },
+    {
+      "check": "silver_reject_rate_ok",
+      "passed": false,
+      "detail": "0.34652605459057073 over 8060 input rows (max 0.2)"
+    },
+    {
+      "check": "visits_msgs_equal_silver_near_rows",
+      "passed": true,
+      "detail": "visits=2768 silver=2768"
+    },
+    {
+      "check": "hourly_msgs_equal_silver_near_rows",
+      "passed": true,
+      "detail": "hourly=2768 silver=2768"
+    },
+    {
+      "check": "zone_msgs_reconcile",
+      "passed": true,
+      "detail": "visits=1334 hourly=1334 silver=1334"
+    },
+    {
+      "check": "no_negative_durations_or_null_keys",
+      "passed": true,
+      "detail": "neg=0 nullkeys=0"
+    }
+  ],
+  "status": "FAILED"
+}

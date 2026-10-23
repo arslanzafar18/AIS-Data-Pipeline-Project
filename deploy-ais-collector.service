@@ -1,0 +1,12 @@
+[Unit]
+Description=AIS collector (Bronze)
+After=network-online.target
+[Service]
+WorkingDirectory=/home/ubuntu/ais-pipeline
+EnvironmentFile=/home/ubuntu/ais-pipeline/.env
+Environment=PYTHONPATH=/home/ubuntu/ais-pipeline
+ExecStart=/home/ubuntu/ais-pipeline/.venv/bin/python -m collector.collector
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

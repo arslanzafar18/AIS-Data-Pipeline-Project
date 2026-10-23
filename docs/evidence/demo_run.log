@@ -1,0 +1,84 @@
+{"malformed": 11, "bad_mmsi": 28, "sentinel": 54, "duplicates": 110, "valid_unique": 4857, "corrected_sog": 33, "unknown_field_rows": 25, "files": 45, "total_lines": 5060, "visitors": 10}
+                                                                                
+                                                                                
+{"input_rows": 928, "parse_failed": 1, "rows_with_unknown_fields": 3, "valid_rows": 913, "rejected_rows": 15, "corrected_sog": 8, "corrected_heading": 258, "corrected_rot": 0, "corrected_shiptype": 0, "null_name": 0, "rej_parse_failed": 1, "rej_bad_mmsi": 2, "rej_bad_timestamp": 0, "rej_missing_position": 0, "rej_sentinel_position": 12, "rej_out_of_range": 0, "rej_future_timestamp": 0, "latency_p50_s": 3, "latency_p95_s": 6, "in_batch_duplicates": 19, "cross_batch_duplicates": 0, "accepted_rows": 894, "near_installation_rows": 397, "at_zone_rows": 60, "batch_id": 0, "env": "dev", "processed_at": "2026-10-11T09:10:21.753257+00:00", "runtime_s": 12.75, "reject_rate": 0.0162}
+                                                                                
+{"input_rows": 1551, "parse_failed": 5, "rows_with_unknown_fields": 10, "valid_rows": 1524, "rejected_rows": 27, "corrected_sog": 10, "corrected_heading": 458, "corrected_rot": 0, "corrected_shiptype": 0, "null_name": 0, "rej_parse_failed": 5, "rej_bad_mmsi": 8, "rej_bad_timestamp": 0, "rej_missing_position": 0, "rej_sentinel_position": 14, "rej_out_of_range": 0, "rej_future_timestamp": 0, "latency_p50_s": 4, "latency_p95_s": 6, "in_batch_duplicates": 30, "cross_batch_duplicates": 0, "accepted_rows": 1494, "near_installation_rows": 1034, "at_zone_rows": 649, "batch_id": 1, "env": "dev", "processed_at": "2026-10-11T09:10:29.448310+00:00", "runtime_s": 7.27, "reject_rate": 0.0174}
+{"input_rows": 1519, "parse_failed": 1, "rows_with_unknown_fields": 9, "valid_rows": 1491, "rejected_rows": 28, "corrected_sog": 8, "corrected_heading": 425, "corrected_rot": 0, "corrected_shiptype": 0, "null_name": 0, "rej_parse_failed": 1, "rej_bad_mmsi": 13, "rej_bad_timestamp": 0, "rej_missing_position": 0, "rej_sentinel_position": 14, "rej_out_of_range": 0, "rej_future_timestamp": 0, "latency_p50_s": 4, "latency_p95_s": 6, "in_batch_duplicates": 37, "cross_batch_duplicates": 3, "accepted_rows": 1451, "near_installation_rows": 1001, "at_zone_rows": 588, "batch_id": 2, "env": "dev", "processed_at": "2026-10-11T09:10:36.023812+00:00", "runtime_s": 5.26, "reject_rate": 0.0184}
+{"input_rows": 860, "parse_failed": 4, "rows_with_unknown_fields": 3, "valid_rows": 841, "rejected_rows": 19, "corrected_sog": 7, "corrected_heading": 260, "corrected_rot": 0, "corrected_shiptype": 0, "null_name": 0, "rej_parse_failed": 4, "rej_bad_mmsi": 4, "rej_bad_timestamp": 0, "rej_missing_position": 0, "rej_sentinel_position": 11, "rej_out_of_range": 0, "rej_future_timestamp": 0, "latency_p50_s": 3, "latency_p95_s": 6, "in_batch_duplicates": 16, "cross_batch_duplicates": 3, "accepted_rows": 822, "near_installation_rows": 336, "at_zone_rows": 37, "batch_id": 3, "env": "dev", "processed_at": "2026-10-11T09:10:41.905340+00:00", "runtime_s": 4.94, "reject_rate": 0.0221}
+                                                                                
+{"input_rows": 202, "parse_failed": 0, "rows_with_unknown_fields": 0, "valid_rows": 198, "rejected_rows": 4, "corrected_sog": 0, "corrected_heading": 52, "corrected_rot": 0, "corrected_shiptype": 0, "null_name": 0, "rej_parse_failed": 0, "rej_bad_mmsi": 1, "rej_bad_timestamp": 0, "rej_missing_position": 0, "rej_sentinel_position": 3, "rej_out_of_range": 0, "rej_future_timestamp": 0, "latency_p50_s": 4, "latency_p95_s": 6, "in_batch_duplicates": 2, "cross_batch_duplicates": 0, "accepted_rows": 196, "near_installation_rows": 0, "at_zone_rows": 0, "batch_id": 4, "env": "dev", "processed_at": "2026-10-11T09:10:48.308420+00:00", "runtime_s": 5.61, "reject_rate": 0.0198}
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+{
+  "run_id": "6d8a2cdb1f",
+  "env": "dev",
+  "finished_at": "2026-10-11T09:11:11.802978+00:00",
+  "silver_rows": 4857,
+  "silver_rows_before_dedupe": 4857,
+  "silver_max_event_ts": "2026-10-11 11:29:00",
+  "tables": {
+    "vessel_visits": 10,
+    "installation_activity_hourly": 6
+  },
+  "checks": [
+    {
+      "check": "silver_has_enough_rows",
+      "passed": true,
+      "detail": "4857 rows (min 100)"
+    },
+    {
+      "check": "silver_reject_rate_ok",
+      "passed": true,
+      "detail": "0.018379446640316207 over 5060 input rows (max 0.2)"
+    },
+    {
+      "check": "visits_msgs_equal_silver_near_rows",
+      "passed": true,
+      "detail": "visits=2768 silver=2768"
+    },
+    {
+      "check": "hourly_msgs_equal_silver_near_rows",
+      "passed": true,
+      "detail": "hourly=2768 silver=2768"
+    },
+    {
+      "check": "zone_msgs_reconcile",
+      "passed": true,
+      "detail": "visits=1334 hourly=1334 silver=1334"
+    },
+    {
+      "check": "no_negative_durations_or_null_keys",
+      "passed": true,
+      "detail": "neg=0 nullkeys=0"
+    }
+  ],
+  "status": "READY"
+}
+== environment: dev ==
+collector: no heartbeat file
+silver: 5 batches, input 5060, accepted 4857, rejected 93 (1.84%), duplicates 110
+reject reasons: {'parse_failed': 11, 'bad_mmsi': 28, 'sentinel_position': 54}
+latency p95 (last batch): 6 s; last batch runtime 5.61 s
+gold READY at 2026-10-11T09:11:11.802978+00:00: tables {'vessel_visits': 10, 'installation_activity_hourly': 6}
+   PASS silver_has_enough_rows: 4857 rows (min 100)
+   PASS silver_reject_rate_ok: 0.018379446640316207 over 5060 input rows (max 0.2)
+   PASS visits_msgs_equal_silver_near_rows: visits=2768 silver=2768
+   PASS hourly_msgs_equal_silver_near_rows: hourly=2768 silver=2768
+   PASS zone_msgs_reconcile: visits=1334 hourly=1334 silver=1334
+   PASS no_negative_durations_or_null_keys: neg=0 nullkeys=0
+                                                                                
+PASS  input rows == generated lines: got 5060, expected 5060
+PASS  parse_failed == malformed: got 11, expected 11
+PASS  rejected bad_mmsi: got 28, expected 28
+PASS  rejected sentinel_position: got 54, expected 54
+PASS  duplicates removed (in-batch + cross-batch): got 110, expected 110
+PASS  Silver rows == valid unique: got 4857, expected 4857
+PASS  sog corrections: got 33, expected 33
+PASS  rows with unknown fields (schema drift): got 25, expected 25
+PASS  Gold visits == visitor vessels: got 10, expected 10
+PASS  all visits entered 500 m zone: got 10, expected 10
+PASS  Gold READY manifest: got READY, expected READY

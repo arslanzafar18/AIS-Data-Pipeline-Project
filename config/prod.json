@@ -1,0 +1,22 @@
+{
+  "env": "prod",
+  "data_root": "data/prod",
+  "metrics_dir": "metrics/prod",
+  "flush_seconds": 120,
+  "spark_master": "local[2]",
+  "shuffle_partitions": 8,
+  "facility_name_col": "fclName",
+  "facility_kind_col": "fclKind",
+  "near_m": 5000,
+  "at_m": 500,
+  "stationary_kn": 0.5,
+  "visit_gap_s": 1800,
+  "cross_batch_dedupe": true,
+  "max_files_per_trigger": 200,
+  "lookback_days": 2,
+  "gate": {
+    "min_silver_rows": 1000,
+    "max_reject_rate": 0.10,
+    "max_silver_staleness_min": 30
+  }
+}

@@ -1,0 +1,46 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - run: pip install -r requirements.txt pyflakes
+      - name: Static check
+        run: python -m pyflakes collector spark scripts reference tests pipeline_config.py
+      - name: Unit tests (config, schemas, Silver rules, Gold logic)
+        run: PYTHONPATH=. pytest -q
+      - name: End-to-end run on synthetic data (Bronze -> Silver -> Gold -> verification)
+        run: scripts/run_demo.sh
+      - name: Gold publish gate blocks bad data
+        run: scripts/demo_gate_failure.sh
+      - name: Keep run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-evidence
+          path: |
+            data/dev/quality/
+            data/dev/gold/_READY.json
+            data/dev/gold/_LAST_FAILED.json
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to the always-on host over SSH (prod config)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.HOST_USER }}
+          key: ${{ secrets.HOST_SSH_KEY }}
+          script: |
+            cd ~/ais-pipeline && git pull --ff-only
+            .venv/bin/pip install -r requirements.txt
+            sudo systemctl restart ais-collector ais-pipeline-loop

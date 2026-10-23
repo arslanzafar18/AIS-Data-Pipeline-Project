@@ -1,0 +1,12 @@
+[Unit]
+Description=AIS Silver (every 2 min) and Gold (hourly) loop
+After=network-online.target
+[Service]
+WorkingDirectory=/home/ubuntu/ais-pipeline
+EnvironmentFile=/home/ubuntu/ais-pipeline/.env
+Environment=PYTHONPATH=/home/ubuntu/ais-pipeline
+ExecStart=/home/ubuntu/ais-pipeline/scripts/run_pipeline_loop.sh
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
