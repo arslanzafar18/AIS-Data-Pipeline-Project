@@ -16,11 +16,13 @@ PAYLOAD_SCHEMA = T.StructType([
     T.StructField("trueHeading", T.IntegerType()), T.StructField("rateOfTurn", T.DoubleType()),
     T.StructField("name", T.StringType()), T.StructField("shipType", T.IntegerType()),
     T.StructField("navigationalStatus", T.IntegerType()), T.StructField("destination", T.StringType()),
-    T.StructField("callSign", T.StringType()), T.StructField("imo", T.LongType()),
+    T.StructField("callSign", T.StringType()), T.StructField("imoNumber", T.LongType()),
     T.StructField("shipLength", T.IntegerType()), T.StructField("shipWidth", T.IntegerType()),
 ])
 BRONZE_SCHEMA = T.StructType([T.StructField(n, T.StringType()) for n in
                               ["_source", "_ingest_ts", "_run_id", "_file", "payload"]])
+KNOWN_UNUSED_FIELDS = ["altitude", "dimensionA", "dimensionB", "dimensionC", "dimensionD", "draught", "eta",
+                       "msgtimeStatic", "positionFixingDeviceType", "reportClass", "stream"]
 REJECT_REASONS = ["parse_failed", "bad_mmsi", "bad_timestamp", "missing_position",
                   "sentinel_position", "out_of_range", "future_timestamp"]
 
@@ -33,8 +35,8 @@ def parse(bronze: DataFrame) -> DataFrame:
     j = F.from_json("payload", ext, {"columnNameOfCorruptRecord": "_corrupt"})
     failed = j.isNull() | j["_corrupt"].isNotNull()
     keys = F.map_keys(F.from_json("payload", "map<string,string>"))
-    drift = F.coalesce(F.size(F.array_except(keys, F.array(*[F.lit(n) for n in names]))) > 0, F.lit(False)) & ~failed
-    cols = [j[n].alias(n) for n in names]
+    drift = F.coalesce(F.size(F.array_except(keys, F.array(*[F.lit(n) for n in names + KNOWN_UNUSED_FIELDS]))) > 0, F.lit(False)) & ~failed
+    cols = [j[n].alias("imo" if n == "imoNumber" else n) for n in names]
     return bronze.select("_run_id", "_file", "_ingest_ts", "payload", drift.alias("unknown_fields"),
                          failed.alias("parse_failed"), *cols)
 
