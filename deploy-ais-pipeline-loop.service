@@ -2,6 +2,7 @@
 Description=AIS Silver (every 2 min) and Gold (hourly) loop
 After=network-online.target
 [Service]
+User=ubuntu
 WorkingDirectory=/home/ubuntu/AIS-Data-Pipeline-Project
 EnvironmentFile=/home/ubuntu/AIS-Data-Pipeline-Project/.env
 Environment=PYTHONPATH=/home/ubuntu/AIS-Data-Pipeline-Project
