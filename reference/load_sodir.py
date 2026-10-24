@@ -33,6 +33,8 @@ for name, url in SRC.items():
             w = csv.writer(fh)
             w.writerow(fields + ["centroid_lon", "centroid_lat", "_source", "_ingest_ts"])
             for sr in sf.shapeRecords():
+                if sr.shape.shapeType == 0:
+                    continue
                 x0, y0, x1, y1 = sr.shape.bbox if sr.shape.shapeType not in (1, 11, 21) else (*sr.shape.points[0],) * 2
                 lon, lat = (x0 + x1) / 2, (y0 + y1) / 2
                 if tr: lon, lat = tr.transform(lon, lat)
