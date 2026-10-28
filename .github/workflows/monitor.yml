@@ -1,15 +1,14 @@
 name: monitor
 on:
   schedule:
-    - cron: "*/10 * * * *"     # GitHub minimum interval is 5 min; runs can be delayed under load
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 jobs:
   health:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted      # reads the heartbeat and Gold manifest on the always-on host
     steps:
-      - uses: actions/checkout@v4
       - name: Collector heartbeat and Gold readiness (a failure notifies the repo owner)
         env:
-          HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
-          GOLD_URL: ${{ secrets.GOLD_URL }}
-        run: python scripts/check_heartbeat.py
+          HEARTBEAT_URL: file:///home/ubuntu/AIS-Data-Pipeline-Project/metrics/prod/heartbeat.json
+          GOLD_URL: file:///home/ubuntu/AIS-Data-Pipeline-Project/data/prod/gold/_READY.json
+        run: /home/ubuntu/spark-env/bin/python /home/ubuntu/AIS-Data-Pipeline-Project/scripts/check_heartbeat.py

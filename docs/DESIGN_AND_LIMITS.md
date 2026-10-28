@@ -15,4 +15,4 @@
 - The Sodir shapefile projection/column names are confirmed at first load (`reference/load_sodir.py` prints them).
 - Benchmarks and the end-to-end run use SYNTHETIC data on a 1-core machine: they show relative effects and logic correctness, not real AIS volumes.
 - Gold swap uses local-filesystem moves; on object storage use Delta or a manifest pointer.
-- Monitoring needs the heartbeat/manifest JSON exposed at an HTTPS URL (secrets `HEARTBEAT_URL`, `GOLD_URL`).
+- Monitoring runs on the self-hosted runner and reads the heartbeat and Gold manifest as local files. It cannot alert if the whole host is down (the runner goes offline and scheduled runs queue); an external check would need the JSON exposed over HTTPS.

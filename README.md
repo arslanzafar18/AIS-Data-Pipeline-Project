@@ -26,5 +26,5 @@ PYTHONPATH=. pytest -q         # unit tests
 | `config/dev.json`, `config/prod.json` | Environment settings (`APP_ENV`) |
 | `.github/workflows/` | `ci.yml` (tests, e2e, deploy), `monitor.yml` (heartbeat + Gold readiness) |
 | `tests/`, `scripts/` | Unit tests; demo, benchmark, status and report tools |
-Secrets for Actions: `HOST`, `HOST_USER`, `HOST_SSH_KEY` (deploy), `HEARTBEAT_URL`, `GOLD_URL` (monitor; JSON files must be exposed over HTTPS).
+Deploy and monitor run on the self-hosted runner on the always-on host, so no repository secrets are needed; the monitor reads the heartbeat and Gold manifest as local files.
 Data: Barentswatch/Kystverket open AIS and Sodir FactPages under NLOD — keep source attribution.
