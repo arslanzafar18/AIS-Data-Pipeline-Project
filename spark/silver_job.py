@@ -16,7 +16,7 @@ from spark.common import load_facilities
 from spark.session import get_spark
 
 
-def main():
+def main(src="bronze/raw", ckpt="_checkpoints/silver", max_files=None):
     cfg = pipeline_config.load()
     P = lambda rel: pipeline_config.path(cfg, rel)
     spark = get_spark(cfg, "silver")
@@ -53,7 +53,7 @@ def main():
         q.update(accepted_rows=int(a["n"]), near_installation_rows=int(a["near"] or 0), at_zone_rows=int(a["at_zone"] or 0))
         out.coalesce(1).write.mode("append").partitionBy("dt", "hour").parquet(P("silver/positions"))
 
-        q.update(batch_id=int(batch_id), env=cfg["env"], processed_at=datetime.now(timezone.utc).isoformat(),
+        q.update(batch_id=int(batch_id), env=cfg["env"], source=("live" if src == "bronze/raw" else "historic"), processed_at=datetime.now(timezone.utc).isoformat(),
                  runtime_s=round(time.time() - t0, 2),
                  reject_rate=round(q["rejected_rows"] / max(q["input_rows"], 1), 4))
         with open(P("quality/silver_metrics.jsonl"), "a") as f:
@@ -63,12 +63,18 @@ def main():
             x.unpersist()
 
     (spark.readStream.schema(L.BRONZE_SCHEMA)
-          .option("maxFilesPerTrigger", str(cfg.get("max_files_per_trigger", 1000)))
+          .option("maxFilesPerTrigger", str(max_files or cfg.get("max_files_per_trigger", 1000)))
           .option("pathGlobFilter", "*.jsonl.gz").option("recursiveFileLookup", "true")
-          .json(P("bronze/raw"))
-          .writeStream.foreachBatch(process).option("checkpointLocation", P("_checkpoints/silver"))
+          .json(P(src))
+          .writeStream.foreachBatch(process).option("checkpointLocation", P(ckpt))
           .trigger(availableNow=True).start().awaitTermination())
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--src", default="bronze/raw")
+    ap.add_argument("--ckpt", default="_checkpoints/silver")
+    ap.add_argument("--max-files", type=int, default=None)
+    a = ap.parse_args()
+    main(a.src, a.ckpt, a.max_files)

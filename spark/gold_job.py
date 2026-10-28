@@ -29,6 +29,7 @@ def silver_reject_rate(cfg, path, lookback_days):
 
 def main():
     cfg = pipeline_config.load()
+    cfg["lookback_days"] = int(os.environ.get("GOLD_LOOKBACK_DAYS", cfg["lookback_days"]))
     P = lambda rel: pipeline_config.path(cfg, rel)
     gate = cfg["gate"]
     run_id = uuid.uuid4().hex[:10]

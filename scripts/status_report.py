@@ -17,7 +17,7 @@ else:
 mp = P("quality/silver_metrics.jsonl")
 if os.path.exists(mp):
     M = [json.loads(l) for l in open(mp)]
-    tot = lambda k: sum(m[k] for m in M)
+    tot = lambda k: sum((m.get(k) or 0) for m in M)
     print(f"silver: {len(M)} batches, input {tot('input_rows')}, accepted {tot('accepted_rows')}, "
           f"rejected {tot('rejected_rows')} ({tot('rejected_rows')/max(tot('input_rows'),1):.2%}), "
           f"duplicates {tot('in_batch_duplicates')+tot('cross_batch_duplicates')}")
