@@ -6,4 +6,5 @@ def get_spark(cfg, name):
             .config("spark.sql.shuffle.partitions", str(cfg["shuffle_partitions"]))
             .config("spark.sql.session.timeZone", "UTC")
             .config("spark.sql.ansi.enabled", "false")      # same behaviour on Spark 3.5 and 4.x
-            .config("spark.ui.enabled", "false").getOrCreate())
+            .config("spark.ui.enabled", "false")
+            .config("spark.driver.memory", cfg.get("driver_memory", "1g")).getOrCreate())

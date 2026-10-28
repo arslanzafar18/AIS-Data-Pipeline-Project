@@ -13,7 +13,8 @@
   "visit_gap_s": 1800,
   "cross_batch_dedupe": true,
   "max_files_per_trigger": 200,
-  "lookback_days": 2,
+  "lookback_days": 30,
+  "driver_memory": "6g",
   "gate": {
     "min_silver_rows": 1000,
     "max_reject_rate": 0.10,
