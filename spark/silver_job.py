@@ -46,7 +46,7 @@ def main(src="bronze/raw", ckpt="_checkpoints/silver", max_files=None):
         else:
             d2 = d
 
-        out = (L.enrich(d2, fac, cfg["near_m"], cfg["at_m"], cfg["stationary_kn"])
+        out = (L.enrich(d2, fac, cfg["near_m"], cfg["at_m"], cfg["stationary_kn"], cfg.get("near_m_onshore"))
                 .select(*L.SILVER_COLUMNS).cache())
         a = out.agg(F.count("*").alias("n"), F.sum(F.col("is_near_installation").cast("int")).alias("near"),
                     F.sum(F.col("is_at_installation").cast("int")).alias("at_zone")).collect()[0]

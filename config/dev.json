@@ -9,6 +9,11 @@
   "facility_kind_col": "fclKind",
   "near_m": 5000,
   "at_m": 500,
+  "near_m_onshore": 1500,
+  "onshore_kinds": [
+    "ONSHORE FACILITY"
+  ],
+  "facility_filter": null,
   "stationary_kn": 0.5,
   "visit_gap_s": 1800,
   "cross_batch_dedupe": true,
@@ -16,7 +21,7 @@
   "lookback_days": 2,
   "gate": {
     "min_silver_rows": 100,
-    "max_reject_rate": 0.20,
+    "max_reject_rate": 0.2,
     "max_silver_staleness_min": null
   }
 }

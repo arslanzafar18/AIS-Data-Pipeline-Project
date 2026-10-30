@@ -41,7 +41,7 @@ def near_pairs(v, fac, prefilter):
              .where(F.col("dist_m") <= cfg["near_m"]))
 
 def prefiltered(v, fac):
-    return L.enrich(v, fac, cfg["near_m"], cfg["at_m"], cfg["stationary_kn"])
+    return L.enrich(v, fac, cfg["near_m"], cfg["at_m"], cfg["stationary_kn"], cfg.get("near_m_onshore"))
 
 def timed(label, fn, shuffle):
     spark.conf.set("spark.sql.shuffle.partitions", str(shuffle))

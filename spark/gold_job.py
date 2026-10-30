@@ -35,7 +35,7 @@ def main():
     run_id = uuid.uuid4().hex[:10]
     spark = get_spark(cfg, "gold")
 
-    silver = spark.read.parquet(P("silver/positions"))
+    silver = spark.read.option("mergeSchema", "true").parquet(P("silver/positions"))
     max_dt = silver.agg(F.max("dt")).collect()[0][0]
     silver = silver.where(F.col("dt") >= F.date_sub(F.lit(max_dt), cfg["lookback_days"] - 1))
     deduped = silver.dropDuplicates(["mmsi", "event_ts"])            # late/duplicate rows that slipped past Silver
