@@ -10,6 +10,7 @@ import json, os, shutil, sys, uuid
 from datetime import datetime, timezone, timedelta
 from pyspark.sql import functions as F
 
+import observability as obs
 import pipeline_config
 from spark.gold_logic import build_hourly, build_visits
 from spark.session import get_spark
@@ -44,14 +45,19 @@ def main():
     visits = build_visits(near, cfg["visit_gap_s"]).cache()
     hourly = build_hourly(near).cache()
 
+    _sp = obs.start("gold.silver_stats")   # includes reading Silver + dedupe
     s = deduped.agg(F.count("*").alias("n"), F.max("event_ts").alias("max_ts"),
                     F.sum(F.col("is_near_installation").cast("int")).alias("near"),
                     F.sum(F.col("is_at_installation").cast("int")).alias("zone")).collect()[0]
+    _sp.end(); _sp = obs.start("gold.build_visits")
     v = visits.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs"), F.sum("msgs_in_zone").alias("zone"),
                    F.sum((F.col("duration_min") < 0).cast("int")).alias("neg"),
                    F.sum(F.col("mmsi").isNull().cast("int") + F.col("inst_name").isNull().cast("int")).alias("nullkeys")).collect()[0]
+    _sp.end(); _sp = obs.start("gold.build_hourly")
     h = hourly.agg(F.count("*").alias("n"), F.sum("position_msgs").alias("msgs"), F.sum("msgs_in_zone").alias("zone")).collect()[0]
+    _sp.end(); _sp = obs.start("gold.count_raw")
     raw_n = silver.count()
+    _sp.end()
     rr, rr_in = silver_reject_rate(cfg, P("quality/silver_metrics.jsonl"), cfg["lookback_days"])
 
     checks = []
@@ -71,12 +77,18 @@ def main():
     manifest = {"run_id": run_id, "env": cfg["env"], "finished_at": datetime.now(timezone.utc).isoformat(),
                 "silver_rows": s["n"], "silver_rows_before_dedupe": raw_n, "silver_max_event_ts": str(s["max_ts"]),
                 "tables": {"vessel_visits": v["n"], "installation_activity_hourly": h["n"]}, "checks": checks}
+    obs.annotate(run_id=run_id, silver_rows=s["n"], vessel_visits=v["n"], hourly_rows=h["n"], gate_passed=ok,
+                 failed_checks=[c["check"] for c in checks if not c["passed"]])
+    for c in checks:
+        obs.event("check", check=c["check"], passed=c["passed"], detail=c["detail"])
     os.makedirs(P("gold"), exist_ok=True)
     if not ok:
+        obs.mark_error("quality gate failed")
         manifest["status"] = "FAILED"
         json.dump(manifest, open(P("gold/_LAST_FAILED.json"), "w"), indent=2)
         print(json.dumps(manifest, indent=2)); sys.exit("Gold NOT published: quality checks failed")
 
+    _sp = obs.start("gold.publish")
     stage = P(f"gold/_staging/{run_id}")
     visits.write.mode("overwrite").parquet(f"{stage}/vessel_visits")
     hourly.write.mode("overwrite").parquet(f"{stage}/installation_activity_hourly")
@@ -87,10 +99,17 @@ def main():
         shutil.move(f"{stage}/{t}", final)
         shutil.rmtree(prev, ignore_errors=True)
     shutil.rmtree(P("gold/_staging"), ignore_errors=True)
+    _sp.end()
     manifest["status"] = "READY"
     json.dump(manifest, open(P("gold/_READY.json"), "w"), indent=2)
     print(json.dumps(manifest, indent=2))
 
 
+def traced_main():
+    obs.init("ais-gold", pipeline_config.load()["env"])
+    with obs.span("gold.run"):
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    traced_main()

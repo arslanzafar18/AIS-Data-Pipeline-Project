@@ -10,6 +10,7 @@ import json, os, time
 from datetime import datetime, timezone
 from pyspark.sql import functions as F
 
+import observability as obs
 import pipeline_config
 from spark import silver_logic as L
 from spark.common import load_facilities
@@ -18,6 +19,7 @@ from spark.session import get_spark
 
 def main(src="bronze/raw", ckpt="_checkpoints/silver", max_files=None):
     cfg = pipeline_config.load()
+    obs.init("ais-silver" if src == "bronze/raw" else "ais-silver-historic", cfg["env"])
     P = lambda rel: pipeline_config.path(cfg, rel)
     spark = get_spark(cfg, "silver")
     fac = load_facilities(spark, cfg, P("bronze/reference/facilities.csv")).cache()
@@ -26,32 +28,45 @@ def main(src="bronze/raw", ckpt="_checkpoints/silver", max_files=None):
     def process(df, batch_id):
         if df.isEmpty():
             return
+        with obs.span("silver.batch", batch_id=int(batch_id), env=cfg["env"], source=src):
+            _process(df, batch_id)
+
+    def _process(df, batch_id):
         t0 = time.time()
         flagged = L.validate(L.standardize(L.parse(df))).cache()
-        q = L.quality_agg(flagged)                                   # BEFORE-processing quality (one action)
+        with obs.span("silver.quality_agg"):
+            q = L.quality_agg(flagged)                               # BEFORE-processing quality (one action)
+        with obs.span("silver.lineage"):
+            files = sorted(r[0] for r in flagged.select("_file").distinct().collect() if r[0])
+        obs.annotate(**{"bronze.file_count": len(files), "bronze.first_file": files[0] if files else "",
+                        "bronze.last_file": files[-1] if files else ""})
 
-        (flagged.where("reject_reason is not null")
-                .select(F.lit(batch_id).alias("batch_id"), "_run_id", "_file", "reject_reason", "payload", "ingest_ts")
-                .write.mode("append").parquet(P("silver/rejects")))   # rejected rows are kept, with the reason
+        with obs.span("silver.write_rejects"):
+            (flagged.where("reject_reason is not null")
+                    .select(F.lit(batch_id).alias("batch_id"), "_run_id", "_file", "reject_reason", "payload", "ingest_ts")
+                    .write.mode("append").parquet(P("silver/rejects")))   # rejected rows are kept, with the reason
 
-        d = L.dedupe(flagged.where("reject_reason is null")).cache()
-        n_dedup = d.count()
-        q["in_batch_duplicates"] = q["valid_rows"] - n_dedup
-        q["cross_batch_duplicates"] = 0
-        if cfg["cross_batch_dedupe"] and os.path.exists(P("silver/positions")):
-            dts = [r[0] for r in d.select(F.to_date("event_ts")).distinct().collect()]
-            keys = spark.read.parquet(P("silver/positions")).where(F.col("dt").isin(dts)).select("mmsi", "event_ts")
-            d2 = d.join(keys, ["mmsi", "event_ts"], "left_anti").cache()
-            q["cross_batch_duplicates"] = n_dedup - d2.count()
-        else:
-            d2 = d
+        with obs.span("silver.dedupe"):
+            d = L.dedupe(flagged.where("reject_reason is null")).cache()
+            n_dedup = d.count()
+            q["in_batch_duplicates"] = q["valid_rows"] - n_dedup
+            q["cross_batch_duplicates"] = 0
+            if cfg["cross_batch_dedupe"] and os.path.exists(P("silver/positions")):
+                dts = [r[0] for r in d.select(F.to_date("event_ts")).distinct().collect()]
+                keys = spark.read.parquet(P("silver/positions")).where(F.col("dt").isin(dts)).select("mmsi", "event_ts")
+                d2 = d.join(keys, ["mmsi", "event_ts"], "left_anti").cache()
+                q["cross_batch_duplicates"] = n_dedup - d2.count()
+            else:
+                d2 = d
 
-        out = (L.enrich(d2, fac, cfg["near_m"], cfg["at_m"], cfg["stationary_kn"], cfg.get("near_m_onshore"))
-                .select(*L.SILVER_COLUMNS).cache())
-        a = out.agg(F.count("*").alias("n"), F.sum(F.col("is_near_installation").cast("int")).alias("near"),
-                    F.sum(F.col("is_at_installation").cast("int")).alias("at_zone")).collect()[0]
+        with obs.span("silver.enrich"):
+            out = (L.enrich(d2, fac, cfg["near_m"], cfg["at_m"], cfg["stationary_kn"], cfg.get("near_m_onshore"))
+                    .select(*L.SILVER_COLUMNS).cache())
+            a = out.agg(F.count("*").alias("n"), F.sum(F.col("is_near_installation").cast("int")).alias("near"),
+                        F.sum(F.col("is_at_installation").cast("int")).alias("at_zone")).collect()[0]
         q.update(accepted_rows=int(a["n"]), near_installation_rows=int(a["near"] or 0), at_zone_rows=int(a["at_zone"] or 0))
-        out.coalesce(1).write.mode("append").partitionBy("dt", "hour").parquet(P("silver/positions"))
+        with obs.span("silver.write"):
+            out.coalesce(1).write.mode("append").partitionBy("dt", "hour").parquet(P("silver/positions"))
 
         q.update(batch_id=int(batch_id), env=cfg["env"], source=("live" if src == "bronze/raw" else "historic"), processed_at=datetime.now(timezone.utc).isoformat(),
                  runtime_s=round(time.time() - t0, 2),
@@ -59,6 +74,7 @@ def main(src="bronze/raw", ckpt="_checkpoints/silver", max_files=None):
         with open(P("quality/silver_metrics.jsonl"), "a") as f:
             f.write(json.dumps(q) + "\n")
         print(json.dumps(q))
+        obs.annotate(**{f"q.{k}": v for k, v in q.items()})
         for x in (flagged, d, out):
             x.unpersist()
 
