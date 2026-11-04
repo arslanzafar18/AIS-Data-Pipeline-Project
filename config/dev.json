@@ -19,6 +19,8 @@
   "cross_batch_dedupe": true,
   "max_files_per_trigger": 10,
   "lookback_days": 2,
+  "dupe_check_hours": 24,
+  "gold_shuffle_partitions": null,
   "gate": {
     "min_silver_rows": 100,
     "max_reject_rate": 0.2,

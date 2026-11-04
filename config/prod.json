@@ -38,6 +38,8 @@
   "cross_batch_dedupe": true,
   "max_files_per_trigger": 200,
   "lookback_days": 90,
+  "dupe_check_hours": 24,
+  "gold_shuffle_partitions": 32,
   "driver_memory": "6g",
   "gate": {
     "min_silver_rows": 1000,
