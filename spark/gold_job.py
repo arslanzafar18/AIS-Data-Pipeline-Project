@@ -125,6 +125,14 @@ def main():
     manifest["status"] = "READY"
     json.dump(manifest, open(P("gold/_READY.json"), "w"), indent=2)
     print(json.dumps(manifest, indent=2))
+    try:                                            # the dashboard must never fail Gold
+        from spark import dashboard
+        from spark.common import load_facilities
+        with obs.span("gold.dashboard"):
+            fac = load_facilities(spark, dict(cfg, facility_filter=None), P("bronze/reference/facilities.csv"))
+            dashboard.build(visits, hourly, manifest, P("gold/dashboard"), fac=fac)
+    except Exception as e:
+        print(f"dashboard not updated: {e!r}")
 
 
 def traced_main():
