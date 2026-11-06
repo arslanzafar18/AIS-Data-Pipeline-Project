@@ -9,15 +9,41 @@
   "facility_kind_col": "facKind",
   "near_m": 5000,
   "at_m": 500,
+  "near_m_onshore": 1500,
+  "onshore_kinds": [
+    "ONSHORE FACILITY"
+  ],
+  "facility_filter": {
+    "include": {
+      "surface": [
+        "Y"
+      ],
+      "phaseName": [
+        "IN SERVICE",
+        "INSTALLATION"
+      ]
+    },
+    "exclude_kinds": [
+      "LANDFALL",
+      "OFFSHORE WIND TURBINE"
+    ],
+    "fixed_col": "FixMov",
+    "moveable_kinds_allowed": [
+      "FPSO",
+      "FSU"
+    ]
+  },
   "stationary_kn": 0.5,
   "visit_gap_s": 1800,
   "cross_batch_dedupe": true,
   "max_files_per_trigger": 200,
   "lookback_days": 90,
+  "dupe_check_hours": 24,
+  "gold_shuffle_partitions": 32,
   "driver_memory": "6g",
   "gate": {
     "min_silver_rows": 1000,
-    "max_reject_rate": 0.10,
+    "max_reject_rate": 0.1,
     "max_silver_staleness_min": 30
   }
 }

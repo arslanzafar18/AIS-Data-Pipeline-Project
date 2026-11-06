@@ -8,7 +8,9 @@
 | Reject vs correct split | Impossible positions are unusable; unreliable *attributes* are nulled but the position is kept | Thresholds are judgement calls (documented, counted) |
 | Bounding-box prefilter before haversine | Measured 2.4x–6.4x faster join step, same output | Box assumes latitude <= 72 N |
 | Gold gate + manifest | Consumers never see data that failed checks | Failure leaves Gold stale until fixed (alerted by monitor) |
-| Fixed installations only | Sodir publishes fixed facilities; mobile rigs not available | Vessels near mobile rigs are not attributed |
+| Facility filter: surface, in service or installing, fixed or FPSO/FSU | Sodir's list (1,229) is mostly subsea templates, wells and mobile rigs; nearest-wins credited platform traffic to them | Mobile rigs, subsea work sites and wind turbines are not attributed; Silver written before the filter must be rebuilt |
+| Onshore facilities kept, flagged `is_onshore`, 1.5 km radius | Terminals (Mongstad, Kårstø, Sture, Kollsnes) are part of the oil and gas logistics chain | They dominate traffic rankings, so analysts filter on `is_onshore`; the radius is a judgement call |
+| Gold dedupes only once a day (`dupe_check_hours`) | Silver already dedupes across batches; on prod Gold's hourly dedupe removed 0 of 52.5 M rows but cost two full shuffles per hour | A Silver dedupe bug would reach Gold for up to 24 h before the check catches it (result in `quality/gold_dupe_check.json` and the manifest) |
 ## Known limits / assumptions
 - AIS ship type does not reliably identify supply vessels; classification by name/MMSI list is future work.
 - Live stream field names for `modelType=Full` are assumed; confirm with `scripts/infer_schema.py` on real data. Drift is counted, not fatal.

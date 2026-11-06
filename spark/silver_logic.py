@@ -77,17 +77,24 @@ def dedupe(v: DataFrame) -> DataFrame:
     return v.withColumn("_rn", F.row_number().over(w)).where("_rn = 1").drop("_rn")
 
 
-def enrich(v: DataFrame, fac: DataFrame, near_m: float, at_m: float, stationary_kn: float) -> DataFrame:
-    """Nearest installation within near_m. Bounding-box prefilter before exact haversine (see benchmark)."""
-    dlat = near_m / 111000.0 * 1.05
-    dlon = dlat / 0.30          # cos(72 deg): safe up to 72 N
+def enrich(v: DataFrame, fac: DataFrame, near_m: float, at_m: float, stationary_kn: float,
+           near_m_onshore: float = None) -> DataFrame:
+    """Nearest installation within ITS radius: near_m offshore, near_m_onshore for onshore facilities
+    (5 km in a fjord or harbour catches unrelated traffic). Bounding-box prefilter before exact haversine."""
+    if "is_onshore" not in fac.columns:
+        fac = fac.withColumn("is_onshore", F.lit(False))
+    r_on = near_m if near_m_onshore is None else near_m_onshore
+    fac = fac.withColumn("near_r", F.when(F.col("is_onshore"), F.lit(float(r_on))).otherwise(F.lit(float(near_m))))
+    dlat = max(near_m, r_on) / 111000.0 * 1.05
+    dlon = dlat / 0.30          # cos(72 deg); with the margins above this holds to about 73.4 N
     j = (v.select("mmsi", "event_ts", "latitude", "longitude")
           .crossJoin(F.broadcast(fac))
           .where((F.abs(F.col("latitude") - F.col("i_lat")) < dlat) & (F.abs(F.col("longitude") - F.col("i_lon")) < dlon))
           .withColumn("dist_m", haversine_m(F.col("latitude"), F.col("longitude"), F.col("i_lat"), F.col("i_lon")))
-          .where(F.col("dist_m") <= near_m))
+          .where(F.col("dist_m") <= F.col("near_r")))
     w = Window.partitionBy("mmsi", "event_ts").orderBy("dist_m")
-    nearest = j.withColumn("rn", F.row_number().over(w)).where("rn = 1").select("mmsi", "event_ts", "inst_name", "inst_kind", "dist_m")
+    nearest = (j.withColumn("rn", F.row_number().over(w)).where("rn = 1")
+                .select("mmsi", "event_ts", "inst_name", "inst_kind", "is_onshore", "dist_m"))
     return (v.join(nearest, ["mmsi", "event_ts"], "left")
              .withColumn("is_near_installation", F.col("inst_name").isNotNull())
              .withColumn("is_at_installation", F.coalesce(F.col("dist_m") <= at_m, F.lit(False)))
@@ -97,7 +104,7 @@ def enrich(v: DataFrame, fac: DataFrame, near_m: float, at_m: float, stationary_
 
 SILVER_COLUMNS = ["mmsi", "event_ts", "ingest_ts", "latency_s", "latitude", "longitude", "speedOverGround",
                   "courseOverGround", "trueHeading", "rateOfTurn", "name", "shipType", "navigationalStatus",
-                  "destination", "callSign", "imo", "shipLength", "shipWidth", "inst_name", "inst_kind", "dist_m",
+                  "destination", "callSign", "imo", "shipLength", "shipWidth", "inst_name", "inst_kind", "is_onshore", "dist_m",
                   "is_near_installation", "is_at_installation", "is_stationary", "_run_id", "_file", "dt", "hour"]
 
 
