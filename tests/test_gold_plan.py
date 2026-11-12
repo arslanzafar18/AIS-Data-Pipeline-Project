@@ -26,25 +26,6 @@ def test_plan_start_ignores_days_outside_window_and_first_run_takes_all():
     assert gp.plan_start(mt, D, date(2026, 11, 3), 2, last_success_epoch=None) == date(2026, 11, 5)
 
 
-def test_visit_rebuild_start_no_open_visits():
-    assert gp.visit_rebuild_start([(s(2026, 11, 9, 8), s(2026, 11, 9, 9))], D, 1800, date(2026, 11, 1)) == D
-
-
-def test_visit_rebuild_start_follows_a_visit_across_midnight():
-    v = [(s(2026, 11, 11, 22), s(2026, 11, 12, 1))]                # 22:00 to 01:00
-    assert gp.visit_rebuild_start(v, D, 1800, date(2026, 11, 1)) == date(2026, 11, 11)
-
-
-def test_visit_rebuild_start_chains_and_respects_gap_and_window():
-    week_long = [(s(2026, 11, 5, 6), s(2026, 11, 12, 3))]          # standby vessel, 7 days
-    assert gp.visit_rebuild_start(week_long, D, 1800, date(2026, 11, 1)) == date(2026, 11, 5)
-    assert gp.visit_rebuild_start(week_long, D, 1800, date(2026, 11, 8)) == date(2026, 11, 8)   # clamped
-    ended_just_before = [(s(2026, 11, 11, 20), s(2026, 11, 11, 23, 45))]   # ends 15 min before midnight
-    assert gp.visit_rebuild_start(ended_just_before, D, 1800, date(2026, 11, 1)) == date(2026, 11, 11)
-    ended_long_before = [(s(2026, 11, 11, 20), s(2026, 11, 11, 22))]
-    assert gp.visit_rebuild_start(ended_long_before, D, 1800, date(2026, 11, 1)) == D
-
-
 def _mk(path, name="part.parquet"):
     os.makedirs(path, exist_ok=True)
     open(os.path.join(path, name), "w").write("x")

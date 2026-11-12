@@ -2,9 +2,8 @@
 Planning and publishing helpers for incremental Gold. Pure Python (no Spark), so they are unit-tested directly.
 
 Incremental rule: recompute from the earliest CHANGED day S (the last `recent_days` days, plus any older day whose
-Silver files changed since the last successful Gold run) up to the newest day. Visits are rebuilt from an earlier
-day V <= S when a published visit was still open at S, so that no visit is cut in two (a standby vessel can stay
-near an installation for weeks). Partitions are swapped in one day at a time; days older than the lookback are dropped.
+Silver files changed since the last successful Gold run) up to the newest day. Visits still open at S are
+rebuilt by gold_job from their own arrival (see there). Partitions are swapped in one day at a time; days older than the lookback are dropped.
 """
 import calendar, json, os, shutil
 from datetime import date, datetime, timedelta, timezone
@@ -51,20 +50,6 @@ def plan_start(day_mtimes, max_dt, window_start, recent_days, last_success_epoch
 
 def day_start_s(d):
     return calendar.timegm(d.timetuple())
-
-
-def visit_rebuild_start(open_visits, start_day, gap_s, window_start):
-    """open_visits: (arrival_s, departure_s) of published visits, as epoch seconds (UTC).
-    Returns the first day from which visits must be rebuilt so none continuing into `start_day` is cut:
-    any visit that arrived earlier and departed within `gap_s` of the boundary pulls the boundary back."""
-    day = start_day
-    while day > window_start:
-        start = day_start_s(day)
-        earlier = [a for a, d in open_visits if d >= start - gap_s and a < start]
-        if not earlier:
-            break
-        day = max(window_start, datetime.fromtimestamp(min(earlier), timezone.utc).date())
-    return day
 
 
 def days_between(first, last):
