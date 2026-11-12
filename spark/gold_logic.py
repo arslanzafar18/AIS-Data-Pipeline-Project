@@ -137,12 +137,70 @@ def build_ais_gaps(pos: DataFrame, min_gap_s: int, max_gap_s: int, since_ts: str
 
 
 def flag_regular(events: DataFrame, visits: DataFrame, on_col: str, min_days: int, window_days: int) -> DataFrame:
-    """Adds visit_days_before (distinct days with a visit by this vessel to this installation in the window_days
-    before the event's day) and regular_visitor (visit_days_before >= min_days)."""
-    vd = visits.select("mmsi", "inst_name", F.to_date("arrival_ts").alias("vday")).distinct()
+    """Adds days_present_before (distinct days this vessel was present at this installation, counting every day
+    from a visit's arrival to its departure, in the window_days before the event's day) and regular_visitor
+    (days_present_before >= min_days). Counting presence, not arrivals, makes a vessel stationed for weeks regular."""
+    vd = (visits.select("mmsi", "inst_name",
+                        F.explode(F.sequence(F.to_date("arrival_ts"), F.to_date("departure_ts"))).alias("vday"))
+                .distinct())
     e = events.withColumn("_eid", F.monotonically_increasing_id()).cache()
     cnt = (e.select("_eid", "mmsi", "inst_name", F.to_date(on_col).alias("_d")).join(vd, ["mmsi", "inst_name"])
             .where((F.col("vday") < F.col("_d")) & (F.col("vday") >= F.date_sub(F.col("_d"), window_days)))
-            .groupBy("_eid").agg(F.countDistinct("vday").alias("visit_days_before")))
-    return (e.join(cnt, "_eid", "left").fillna(0, ["visit_days_before"])
-             .withColumn("regular_visitor", F.col("visit_days_before") >= min_days).drop("_eid"))
+            .groupBy("_eid").agg(F.countDistinct("vday").alias("days_present_before")))
+    return (e.join(cnt, "_eid", "left").fillna(0, ["days_present_before"])
+             .withColumn("regular_visitor", F.col("days_present_before") >= min_days).drop("_eid"))
+
+
+# ---- flags that separate ordinary operations from events worth a look -------------------------------------------
+
+def _norm_name(c):
+    """Upper case, Norwegian letters spelled out, everything but letters and digits removed: 'Åsgard-B' -> 'ASGARDB'."""
+    c = F.upper(F.trim(c))
+    c = F.regexp_replace(F.regexp_replace(c, "Æ", "AE"), "Ø", "O")
+    c = F.translate(c, "ÅÄÖÜÉ", "AAOUE")
+    return F.regexp_replace(c, "[^A-Z0-9]", "")
+
+
+def flag_facility(df: DataFrame, facility_names: DataFrame, name_col: str = "vessel_name") -> DataFrame:
+    """is_facility: the AIS name matches an installation or rig in Sodir's FULL facility list (fixed and mobile),
+    i.e. the 'vessel' is a platform, FPSO or drilling rig broadcasting AIS itself. Names under 4 characters never match."""
+    names = (facility_names.select(_norm_name(F.col("fac")).alias("_n")).where(F.length("_n") >= 4).distinct()
+                           .withColumn("_fac", F.lit(True)))
+    return (df.withColumn("_n", _norm_name(F.col(name_col))).join(F.broadcast(names), "_n", "left")
+              .withColumn("is_facility", F.coalesce(F.col("_fac"), F.lit(False))).drop("_n", "_fac"))
+
+
+def build_coverage(pos: DataFrame) -> DataFrame:
+    """Messages and distinct vessels per hour over ALL positions: how complete the feed was in each hour."""
+    return (pos.groupBy(F.date_trunc("hour", "event_ts").alias("hour_ts"))
+               .agg(F.count("*").alias("msgs"), F.countDistinct("mmsi").alias("vessels"))
+               .withColumn("dt", F.to_date("hour_ts")))
+
+
+def covered_hours(coverage: DataFrame, min_fraction: float, latest_ts) -> DataFrame:
+    """Hours with at least min_fraction of the median hourly volume, plus every hour from latest_ts's hour on
+    (the current hour is still filling up and must not count as an outage)."""
+    median = coverage.agg(F.percentile_approx("msgs", 0.5)).collect()[0][0] or 0
+    ok = coverage.where(F.col("msgs") >= F.lit(min_fraction * median)).select(F.col("hour_ts").alias("_h"))
+    if latest_ts is not None:
+        ok = ok.unionByName(coverage.where(F.col("hour_ts") >= F.date_trunc("hour", F.lit(latest_ts)))
+                                    .select(F.col("hour_ts").alias("_h")))
+    return ok.distinct().withColumn("_ok", F.lit(True))
+
+
+def flag_censored(events: DataFrame, ok_hours: DataFrame, start_col: str) -> DataFrame:
+    """censored: the hour before the event started was not covered, so it may have begun before the data did."""
+    e = events.withColumn("_h", F.date_trunc("hour", F.col(start_col)) - F.expr("INTERVAL 1 HOUR"))
+    return (e.join(F.broadcast(ok_hours), "_h", "left")
+             .withColumn("censored", F.col("_ok").isNull()).drop("_h", "_ok"))
+
+
+def flag_outage(events: DataFrame, ok_hours: DataFrame, start_col: str, end_col: str) -> DataFrame:
+    """feed_outage: some hour inside the event was not covered, so the whole feed was quiet, not just this vessel."""
+    e = events.withColumn("_eid", F.monotonically_increasing_id()).cache()
+    hrs = (e.select("_eid", F.explode(F.sequence(F.date_trunc("hour", F.col(start_col)), F.date_trunc("hour", F.col(end_col)),
+                                                 F.expr("INTERVAL 1 HOUR"))).alias("_h"))
+            .join(F.broadcast(ok_hours), "_h", "left")
+            .groupBy("_eid").agg(F.sum(F.col("_ok").isNull().cast("int")).alias("_bad")))
+    return (e.join(hrs, "_eid", "left").withColumn("feed_outage", F.coalesce(F.col("_bad"), F.lit(0)) > 0)
+             .drop("_eid", "_bad"))

@@ -48,7 +48,8 @@
     "loiter_max_kn": 2.0,
     "loiter_min_minutes": 120,
     "ais_gap_min_minutes": 30,
-    "ais_gap_max_hours": 12
+    "ais_gap_max_hours": 12,
+    "coverage_min_fraction": 0.5
   },
   "gold_shuffle_partitions": 32,
   "driver_memory": "6g",

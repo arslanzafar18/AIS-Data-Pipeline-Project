@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
-from spark.gold_logic import build_ais_gaps, build_loitering, build_zone_entries, flag_regular
+from spark.gold_logic import (build_ais_gaps, build_coverage, build_loitering, build_zone_entries, covered_hours,
+                              flag_censored, flag_facility, flag_outage, flag_regular)
 
 SCHEMA = ("mmsi long, inst_name string, inst_kind string, is_onshore boolean, event_ts timestamp, dist_m double, "
           "speedOverGround double, name string, shipType int, is_at_installation boolean, is_near_installation boolean")
@@ -39,14 +40,36 @@ def test_ais_gap_only_when_silent_everywhere_and_within_bounds(spark):
     assert build_ais_gaps(spark.createDataFrame(rows, SCHEMA), 1800, 12 * 3600, "2026-11-11 09:30:00").count() == 0
 
 
-def test_regular_visitor_flag_counts_distinct_previous_days(spark):
+def test_regular_visitor_counts_days_present(spark):
+    d = lambda m, day, h=9: datetime(2026, m, day, h)
     visits = spark.createDataFrame(
-        [(1, "PLATFORM", datetime(2026, 11, d, 9)) for d in (1, 1, 5, 9)] +       # 3 distinct days
-        [(2, "PLATFORM", datetime(2026, 11, d, 9)) for d in (5, 9)] +             # 2 days
-        [(1, "PLATFORM", datetime(2026, 9, 1, 9))],                               # outside 30 days
-        "mmsi long, inst_name string, arrival_ts timestamp")
-    events = spark.createDataFrame([(1, "PLATFORM", T0), (2, "PLATFORM", T0), (3, "PLATFORM", T0)],
+        [(1, "PLATFORM", d(11, day), d(11, day, 10)) for day in (1, 1, 5, 9)] +   # present 3 distinct days
+        [(2, "PLATFORM", d(11, day), d(11, day, 10)) for day in (5, 9)] +         # 2 days
+        [(4, "PLATFORM", d(10, 20), d(11, 10))] +                                 # one visit, stationed 22 days
+        [(1, "PLATFORM", d(9, 1), d(9, 1, 10))],                                  # outside the 30 days
+        "mmsi long, inst_name string, arrival_ts timestamp, departure_ts timestamp")
+    events = spark.createDataFrame([(m, "PLATFORM", T0) for m in (1, 2, 3, 4)],
                                    "mmsi long, inst_name string, start_ts timestamp")
-    out = {r["mmsi"]: (r["visit_days_before"], r["regular_visitor"])
+    out = {r["mmsi"]: (r["days_present_before"], r["regular_visitor"])
            for r in flag_regular(events, visits, "start_ts", 3, 30).collect()}
-    assert out == {1: (3, True), 2: (2, False), 3: (0, False)}
+    assert out == {1: (3, True), 2: (2, False), 3: (0, False), 4: (22, True)}
+
+
+def test_facility_flag_matches_sodir_names_loosely(spark):
+    fac = spark.createDataFrame([("ÅSGARD B",), ("NOBLE INVINCIBLE",), ("AB",)], "fac string")
+    ev = spark.createDataFrame([(1, "ASGARD B"), (2, "Noble Invincible"), (3, "HAVEN"), (4, "AB"), (5, None)],
+                               "mmsi long, vessel_name string")
+    out = {r["mmsi"]: r["is_facility"] for r in flag_facility(ev, fac).collect()}
+    assert out == {1: True, 2: True, 3: False, 4: False, 5: False}
+
+
+def test_censored_and_feed_outage_follow_hourly_coverage(spark):
+    h = lambda hh, mm=0: datetime(2026, 11, 11, hh, mm)
+    pos = spark.createDataFrame([(i, h(hh, i % 60)) for hh, n in ((8, 100), (9, 100), (10, 100), (11, 10), (12, 100))
+                                 for i in range(n)], "mmsi long, event_ts timestamp")
+    ok = covered_hours(build_coverage(pos), 0.5, None)
+    loiter = spark.createDataFrame([(1, h(9, 30)), (2, h(8, 10))], "mmsi long, start_ts timestamp")
+    assert {r["mmsi"]: r["censored"] for r in flag_censored(loiter, ok, "start_ts").collect()} == {1: False, 2: True}
+    gaps = spark.createDataFrame([(1, h(10, 30), h(12, 10)), (2, h(9, 10), h(10, 50))],
+                                 "mmsi long, start_ts timestamp, end_ts timestamp")
+    assert {r["mmsi"]: r["feed_outage"] for r in flag_outage(gaps, ok, "start_ts", "end_ts").collect()} == {1: True, 2: False}

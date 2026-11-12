@@ -10,8 +10,11 @@ Gold job: builds consumer tables from Silver and PUBLISHES THEM ONLY IF QUALITY 
   gold/loitering_events              slow (< loiter_max_kn) within 5 km for >= loiter_min_minutes (by start day)
   gold/ais_gap_events                vessel silent >= ais_gap_min_minutes between two positions near an
                                      installation, nothing sent anywhere in between             (by end day)
-  Event tables carry regular_visitor: the vessel visited that installation on >= regular_visitor.min_days
-  distinct days in the regular_visitor.window_days before the event.
+  gold/feed_coverage_hourly          messages and vessels per hour over all positions          (by day)
+  Event tables carry: regular_visitor (present at that installation on >= regular_visitor.min_days distinct days
+  in the regular_visitor.window_days before the event), is_facility (the "vessel" is a platform or rig in Sodir's
+  list broadcasting AIS), censored (started right after a feed gap or the start of the data) and, for AIS gaps,
+  feed_outage (the whole feed was quiet during the gap).
 
 INCREMENTAL: a run recomputes only from the earliest changed day S (the last `gold_recent_days` days, plus any older
 day whose Silver files changed since the last successful run) to the newest day; a published visit still open at S (a
@@ -29,13 +32,14 @@ from pyspark.sql import functions as F
 import observability as obs
 import pipeline_config
 from spark import gold_plan as plan
-from spark.gold_logic import (build_ais_gaps, build_hourly, build_installations, build_loitering, build_vessel_days,
-                              build_vessels, build_visits, build_zone_entries, flag_regular)
+from spark.gold_logic import (build_ais_gaps, build_coverage, build_hourly, build_installations, build_loitering,
+                              build_vessel_days, build_vessels, build_visits, build_zone_entries, covered_hours,
+                              flag_censored, flag_facility, flag_outage, flag_regular)
 from spark.session import get_spark
 
 PARTITIONED = ("vessel_visits", "installation_activity_hourly", "vessel_days",
-               "zone_entries", "loitering_events", "ais_gap_events")
-LAYOUT = "dt-partitioned-v2"      # bump when tables are added or change shape: the next run is then a full rebuild
+               "zone_entries", "loitering_events", "ais_gap_events", "feed_coverage_hourly")
+LAYOUT = "dt-partitioned-v3"      # bump when tables are added or change shape: the next run is then a full rebuild
 REBUILT_FROM_OPEN_VISITS = {"vessel_visits": "arrival_ts", "zone_entries": "entry_ts", "loitering_events": "start_ts"}
 DIMENSIONS = ("vessels", "installations")
 
@@ -140,6 +144,7 @@ def main(full=False):
                                                        open_visits, v_day, s_day)).cache()
     hourly = build_hourly(near).withColumn("dt", F.to_date("hour_ts")).cache()
     vdays = build_vessel_days(read).cache()
+    coverage = build_coverage(read).cache()
 
     # ---- use cases 2 and 3: zone entries, loitering, AIS gaps --------------------------------------------
     sc, rv = cfg.get("surveillance", {}), cfg.get("regular_visitor", {"min_days": 3, "window_days": 30})
@@ -159,9 +164,21 @@ def main(full=False):
     if older is not None:
         history = visits.unionByName(older.where(
             (F.col("dt") < F.lit(v_day)) & (F.col("dt") >= F.date_sub(F.lit(v_day), int(rv["window_days"]) + 1))))
-    loiter_new = flag_regular(loiter_new, history, "start_ts", rv["min_days"], rv["window_days"]).withColumn("dt", F.to_date("start_ts")).cache()
-    gaps = flag_regular(gaps_new, history, "end_ts", rv["min_days"], rv["window_days"]).withColumn("dt", F.to_date("end_ts")).cache()
-    zones, loiter = zones_new, loiter_new
+    # flags: Sodir names (all facilities, fixed and mobile) and hourly feed coverage over the whole window
+    fac_names = (spark.read.option("header", True).csv(P("bronze/reference/facilities.csv"))
+                      .select(F.col(cfg.get("facility_name_col", "fclName")).alias("fac")))
+    cov_all = coverage
+    older_cov = None if full else read_table(spark, P("gold/feed_coverage_hourly"))
+    if older_cov is not None:
+        cov_all = coverage.unionByName(older_cov.where((F.col("dt") < F.lit(s_day)) & (F.col("dt") >= F.lit(window_start))))
+    newest = read.agg(F.max("event_ts")).collect()[0][0]
+    ok_hours = covered_hours(cov_all, sc.get("coverage_min_fraction", 0.5), newest).cache()
+    zones_new = flag_censored(flag_facility(zones_new, fac_names), ok_hours, "entry_ts").cache()
+    loiter_new = flag_regular(loiter_new, history, "start_ts", rv["min_days"], rv["window_days"])
+    loiter_new = flag_censored(flag_facility(loiter_new, fac_names), ok_hours, "start_ts").withColumn("dt", F.to_date("start_ts")).cache()
+    gaps = flag_regular(gaps_new, history, "end_ts", rv["min_days"], rv["window_days"])
+    gaps = flag_outage(flag_facility(gaps, fac_names), ok_hours, "start_ts", "end_ts").withColumn("dt", F.to_date("end_ts")).cache()
+    zones, loiter = zones_new, loiter_new   # (zones_new keeps the same rows: the flags only add columns)
     if v_day < s_day:
         zones = union_kept(zones_new, kept_published(spark, P("gold/zone_entries"), "entry_ts", open_visits, v_day, s_day)).cache()
         loiter = union_kept(loiter_new, kept_published(spark, P("gold/loitering_events"), "start_ts", open_visits, v_day, s_day)).cache()
@@ -184,6 +201,8 @@ def main(full=False):
                       F.sum((F.col("minutes_inside") < 0).cast("int")).alias("neg")).collect()[0]
     lo = loiter_new.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs"),
                         F.sum((F.col("duration_min") < sc.get("loiter_min_minutes", 120)).cast("int")).alias("short")).collect()[0]
+    flags = {"loitering_worth_a_look": loiter_new.where("NOT regular_visitor AND NOT is_facility AND NOT censored").count(),
+             "ais_gaps_worth_a_look": gaps.where("NOT regular_visitor AND NOT is_facility AND NOT feed_outage").count()}
     g = gaps.agg(F.count("*").alias("n"), F.sum(((F.col("duration_min") * 60 <= gap_min_s) |
                                                  (F.col("duration_min") * 60 > gap_max_s)).cast("int")).alias("bad")).collect()[0]
     _sp.end()
@@ -219,7 +238,7 @@ def main(full=False):
                 "silver_max_event_ts": str(s["max_ts"]),
                 "recomputed": {"vessel_visits": v["n"], "installation_activity_hourly": h["n"], "vessel_days": d["n"],
                                "zone_entries": z["n"], "loitering_events": lo["n"], "ais_gap_events": g["n"]},
-                "checks": checks}
+                "events_worth_a_look_recomputed": flags, "checks": checks}
     obs.annotate(run_id=run_id, silver_rows=n_s, vessel_visits=v["n"], hourly_rows=h["n"], gate_passed=ok,
                  failed_checks=[c["check"] for c in checks if not c["passed"]])
     for c in checks:
@@ -240,6 +259,7 @@ def main(full=False):
     zones.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/zone_entries")
     loiter.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/loitering_events")
     gaps.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/ais_gap_events")
+    coverage.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/feed_coverage_hourly")
     days = {t: plan.days_between(v_day, max_dt) for t in REBUILT_FROM_OPEN_VISITS}
     for t in PARTITIONED:
         if full:
@@ -247,8 +267,8 @@ def main(full=False):
         else:
             plan.swap_partitions(f"{stage}/{t}", P(f"gold/{t}"), days.get(t, plan.days_between(s_day, max_dt)))
         plan.drop_partitions_before(P(f"gold/{t}"), window_start)
-    build_vessels(spark.read.parquet(P("gold/vessel_days")) if plan.has_data(P("gold/vessel_days"))
-                  else vdays).write.mode("overwrite").parquet(f"{stage}/vessels")
+    flag_facility(build_vessels(spark.read.parquet(P("gold/vessel_days")) if plan.has_data(P("gold/vessel_days"))
+                                else vdays), fac_names, "name").write.mode("overwrite").parquet(f"{stage}/vessels")
     build_installations(spark, cfg, P("bronze/reference/facilities.csv")).write.mode("overwrite").parquet(f"{stage}/installations")
     for t in DIMENSIONS:
         plan.swap_dir(f"{stage}/{t}", P(f"gold/{t}"))
