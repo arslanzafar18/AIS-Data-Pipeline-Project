@@ -30,7 +30,8 @@
     "fixed_col": "FixMov",
     "moveable_kinds_allowed": [
       "FPSO",
-      "FSU"
+      "FSU",
+      "SPAR"
     ]
   },
   "stationary_kn": 0.5,
@@ -51,7 +52,8 @@
     "ais_gap_max_hours": 12,
     "coverage_min_fraction": 0.5,
     "large_ship_min_m": 100,
-    "live_since": "2026-10-24 10:00:00"
+    "live_since": "2026-10-24 10:00:00",
+    "facility_stationary_kn": 1.0
   },
   "gold_shuffle_partitions": 32,
   "driver_memory": "6g",

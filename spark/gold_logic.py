@@ -136,6 +136,7 @@ def build_ais_gaps(pos: DataFrame, min_gap_s: int, max_gap_s: int, since_ts: str
              .select("mmsi", "inst_name", "inst_kind", onshore.alias("is_onshore"),
                      F.col("name").alias("vessel_name"), F.col("shipType").alias("ship_type"),
                      _col_or_null(p, "shipLength", "int").alias("length_m"),
+                     _col_or_null(p, "speedOverGround", "double").alias("sog_kn"),
                      F.col("prev_ts").alias("start_ts"), F.col("event_ts").alias("end_ts"),
                      F.col("prev_inst").alias("start_inst_name"),
                      F.least("prev_dist", "dist_m").alias("min_dist_m"), (gap / 60.0).alias("duration_min"))
@@ -167,13 +168,32 @@ def _norm_name(c):
     return F.regexp_replace(c, "[^A-Z0-9]", "")
 
 
-def flag_facility(df: DataFrame, facility_names: DataFrame, name_col: str = "vessel_name") -> DataFrame:
-    """is_facility: the AIS name matches an installation or rig in Sodir's FULL facility list (fixed and mobile),
-    i.e. the 'vessel' is a platform, FPSO or drilling rig broadcasting AIS itself. Names under 4 characters never match."""
-    names = (facility_names.select(_norm_name(F.col("fac")).alias("_n")).where(F.length("_n") >= 4).distinct()
+FLOATING_KINDS = ["FPSO", "FSU", "FSO", "FPU", "SPAR", "TLP STEEL", "TLP CONCRETE", "SEMISUB STEEL", "SEMISUB CONCRETE",
+                  "JACK-UP 3 LEGS", "JACK-UP 4 LEGS", "VESSEL", "DIVE SUPPORT VESSEL"]
+TYPE_SUFFIXES = ["FPSO", "FSU", "FSO", "FPU", "SPAR", "TLP"]   # a type word at the end of a name, not part of it
+
+
+def own_name(c):
+    """An installation's own name without a trailing type word: 'AASTA HANSTEEN SPAR' -> 'AASTAHANSTEEN'."""
+    return F.regexp_replace(_norm_name(c), "(" + "|".join(TYPE_SUFFIXES) + ")$", "")
+
+
+def flag_facility(df: DataFrame, facility_names: DataFrame, name_col: str = "vessel_name",
+                  speed_col: str = None, stationary_kn: float = 1.0) -> DataFrame:
+    """is_facility: the AIS name matches a unit in Sodir's FULL facility list, i.e. a platform, FPSO or rig
+    broadcasting AIS itself. Fixed platforms always count. Floating units (FPSO, FSU, SPAR, rigs, anything Sodir
+    lists as MOVEABLE) count only while stationary (speed_col < stationary_kn): moving, they are vessels.
+    facility_names has columns fac, and optionally kind and fixmov. Names under 4 characters never match."""
+    kind = F.upper(F.col("kind")) if "kind" in facility_names.columns else F.lit(None).cast("string")
+    fixmov = F.upper(F.col("fixmov")) if "fixmov" in facility_names.columns else F.lit(None).cast("string")
+    floating = kind.isin(FLOATING_KINDS) | (fixmov == "MOVEABLE")
+    names = (facility_names.select(_norm_name(F.col("fac")).alias("_n"), F.coalesce(floating, F.lit(False)).alias("_float"))
+                           .where(F.length("_n") >= 4).groupBy("_n").agg(F.max("_float").alias("_float"))
                            .withColumn("_fac", F.lit(True)))
+    still = F.coalesce(F.col(speed_col) < stationary_kn, F.lit(False)) if speed_col else F.lit(True)
     return (df.withColumn("_n", _norm_name(F.col(name_col))).join(F.broadcast(names), "_n", "left")
-              .withColumn("is_facility", F.coalesce(F.col("_fac"), F.lit(False))).drop("_n", "_fac"))
+              .withColumn("is_facility", F.coalesce(F.col("_fac") & (~F.col("_float") | still), F.lit(False)))
+              .drop("_n", "_fac", "_float"))
 
 
 def build_coverage(pos: DataFrame) -> DataFrame:
@@ -215,8 +235,9 @@ def flag_outage(events: DataFrame, ok_hours: DataFrame, start_col: str, end_col:
 def flag_ordinary(events: DataFrame, large_ship_min_m: int) -> DataFrame:
     """Two kinds of ordinary activity that are not a security concern:
     terminal_call  - a large ship (length_m >= large_ship_min_m) at an ONSHORE facility, e.g. a tanker waiting to berth;
-    support_craft  - the vessel's name contains the installation's own name, e.g. 'DRAUGEN MOB BOAT' at DRAUGEN."""
-    inst = _norm_name(F.col("inst_name"))
+    support_craft  - the vessel's name contains the installation's own name (type word such as FPSO or SPAR ignored),
+                     e.g. 'DRAUGEN MOB BOAT' at DRAUGEN, 'AASTA HANSTEEN MOB' at AASTA HANSTEEN SPAR."""
+    inst = own_name(F.col("inst_name"))
     return (events
             .withColumn("terminal_call", F.coalesce(F.col("is_onshore"), F.lit(False))
                         & F.coalesce(F.col("length_m") >= large_ship_min_m, F.lit(False)))

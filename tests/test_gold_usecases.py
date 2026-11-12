@@ -57,11 +57,17 @@ def test_regular_visitor_counts_days_present(spark):
 
 
 def test_facility_flag_matches_sodir_names_loosely(spark):
-    fac = spark.createDataFrame([("ÅSGARD B",), ("NOBLE INVINCIBLE",), ("AB",)], "fac string")
-    ev = spark.createDataFrame([(1, "ASGARD B"), (2, "Noble Invincible"), (3, "HAVEN"), (4, "AB"), (5, None)],
-                               "mmsi long, vessel_name string")
-    out = {r["mmsi"]: r["is_facility"] for r in flag_facility(ev, fac).collect()}
-    assert out == {1: True, 2: True, 3: False, 4: False, 5: False}
+    fac = spark.createDataFrame([("ÅSGARD B", "SEMISUB STEEL", "FIXED"), ("OSEBERG A", "CONDEEP 4 SHAFTS", "FIXED"),
+                                 ("NOBLE INVINCIBLE", "JACK-UP 3 LEGS", "MOVEABLE"), ("GOLIAT FPSO", "FPSO", "FIXED"),
+                                 ("AB", "JACKET 4 LEGS", "FIXED")], "fac string, kind string, fixmov string")
+    ev = spark.createDataFrame([(1, "ASGARD B", 0.1), (2, "Noble Invincible", 0.2), (3, "HAVEN", 0.0), (4, "AB", 0.0),
+                                (5, None, 0.0), (6, "GOLIAT FPSO", 0.3), (7, "GOLIAT FPSO", 8.5),
+                                (8, "OSEBERG A", 6.0), (9, "NOBLE INVINCIBLE", 7.0)],
+                               "mmsi long, vessel_name string, avg_sog_kn double")
+    out = {r["mmsi"]: r["is_facility"] for r in flag_facility(ev, fac, speed_col="avg_sog_kn").collect()}
+    # floating units (semisub, jack-up, FPSO) count only when stationary; a fixed Condeep always counts
+    assert out == {1: True, 2: True, 3: False, 4: False, 5: False, 6: True, 7: False, 8: True, 9: False}
+    assert {r["mmsi"]: r["is_facility"] for r in flag_facility(ev.drop("avg_sog_kn"), fac.select("fac")).collect()}[2]
 
 
 def test_censored_and_feed_outage_follow_hourly_coverage(spark):
@@ -83,9 +89,12 @@ def test_terminal_calls_and_support_craft_are_ordinary(spark):
         (3, "UNKNOWN", "MONGSTAD", True, None),              # no length: not treated as large
         (4, "DRAUGEN MOB BOAT", "DRAUGEN", False, 8),         # carries the installation's own name
         (5, "ESVAGT FRB76", "EKOFISK K", False, 9),           # rescue boat, other name: still checked
+        (6, "AASTA HANSTEEN MOB", "AASTA HANSTEEN SPAR", False, 9),   # type word in the installation name ignored
+        (7, "GOLIAT MOB", "GOLIAT FPSO", False, 8),
     ], "mmsi long, vessel_name string, inst_name string, is_onshore boolean, length_m int")
     out = {r["mmsi"]: (r["terminal_call"], r["support_craft"]) for r in flag_ordinary(ev, 100).collect()}
-    assert out == {1: (True, False), 2: (False, False), 3: (False, False), 4: (False, True), 5: (False, False)}
+    assert out == {1: (True, False), 2: (False, False), 3: (False, False), 4: (False, True), 5: (False, False),
+                   6: (False, True), 7: (False, True)}
 
 
 def test_worth_a_look_only_when_no_ordinary_explanation(spark):
