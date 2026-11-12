@@ -30,7 +30,9 @@
     "loiter_min_minutes": 120,
     "ais_gap_min_minutes": 30,
     "ais_gap_max_hours": 12,
-    "coverage_min_fraction": 0.5
+    "coverage_min_fraction": 0.5,
+    "large_ship_min_m": 100,
+    "live_since": null
   },
   "gold_shuffle_partitions": null,
   "gate": {

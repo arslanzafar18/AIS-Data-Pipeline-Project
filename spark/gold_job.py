@@ -13,8 +13,10 @@ Gold job: builds consumer tables from Silver and PUBLISHES THEM ONLY IF QUALITY 
   gold/feed_coverage_hourly          messages and vessels per hour over all positions          (by day)
   Event tables carry: regular_visitor (present at that installation on >= regular_visitor.min_days distinct days
   in the regular_visitor.window_days before the event), is_facility (the "vessel" is a platform or rig in Sodir's
-  list broadcasting AIS), censored (started right after a feed gap or the start of the data) and, for AIS gaps,
-  feed_outage (the whole feed was quiet during the gap).
+  list broadcasting AIS), censored (started right after a feed gap or the start of the data), for AIS gaps
+  feed_outage (the whole feed was quiet during the gap), terminal_call (large ship at an onshore facility),
+  support_craft (name contains the installation's name) and worth_a_look (none of these applies).
+  Surveillance events (loitering, AIS gaps) use live data only: they start at or after surveillance.live_since.
 
 INCREMENTAL: a run recomputes only from the earliest changed day S (the last `gold_recent_days` days, plus any older
 day whose Silver files changed since the last successful run) to the newest day; a published visit still open at S (a
@@ -34,12 +36,13 @@ import pipeline_config
 from spark import gold_plan as plan
 from spark.gold_logic import (build_ais_gaps, build_coverage, build_hourly, build_installations, build_loitering,
                               build_vessel_days, build_vessels, build_visits, build_zone_entries, covered_hours,
-                              flag_censored, flag_facility, flag_outage, flag_regular)
+                              flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
+                              mark_worth_a_look)
 from spark.session import get_spark
 
 PARTITIONED = ("vessel_visits", "installation_activity_hourly", "vessel_days",
                "zone_entries", "loitering_events", "ais_gap_events", "feed_coverage_hourly")
-LAYOUT = "dt-partitioned-v3"      # bump when tables are added or change shape: the next run is then a full rebuild
+LAYOUT = "dt-partitioned-v4"      # bump when tables are added or change shape: the next run is then a full rebuild
 REBUILT_FROM_OPEN_VISITS = {"vessel_visits": "arrival_ts", "zone_entries": "entry_ts", "loitering_events": "start_ts"}
 DIMENSIONS = ("vessels", "installations")
 
@@ -154,7 +157,7 @@ def main(full=False):
     zones_new = build_zone_entries(near_v, zone_gap).withColumn("dt", F.to_date("entry_ts")).cache()
     loiter_new = build_loitering(near_v, cfg["visit_gap_s"], sc.get("loiter_max_kn", 2.0), sc.get("loiter_min_minutes", 120))
     cols = [c for c in ("mmsi", "event_ts", "is_near_installation", "inst_name", "inst_kind", "is_onshore", "dist_m",
-                        "name", "shipType") if c in read.columns]
+                        "name", "shipType", "shipLength") if c in read.columns]
     before = (base.where((F.col("dt") == F.date_sub(F.lit(s_day), 1))     # each vessel's messages just before S
                   & (F.col("event_ts") >= F.to_timestamp(F.lit(s_start_ts)) - F.expr(f"INTERVAL {gap_max_s} SECONDS")))
                   .select(*cols).dropDuplicates(["mmsi", "event_ts"]))
@@ -174,10 +177,16 @@ def main(full=False):
     newest = read.agg(F.max("event_ts")).collect()[0][0]
     ok_hours = covered_hours(cov_all, sc.get("coverage_min_fraction", 0.5), newest).cache()
     zones_new = flag_censored(flag_facility(zones_new, fac_names), ok_hours, "entry_ts").cache()
+    large = sc.get("large_ship_min_m", 100)
+    if sc.get("live_since"):   # surveillance uses live data only; the historic backfill is sparser per vessel
+        live = F.col("start_ts") >= F.to_timestamp(F.lit(sc["live_since"]))
+        loiter_new, gaps_new = loiter_new.where(live), gaps_new.where(live)
     loiter_new = flag_regular(loiter_new, history, "start_ts", rv["min_days"], rv["window_days"])
-    loiter_new = flag_censored(flag_facility(loiter_new, fac_names), ok_hours, "start_ts").withColumn("dt", F.to_date("start_ts")).cache()
+    loiter_new = flag_censored(flag_facility(loiter_new, fac_names), ok_hours, "start_ts")
+    loiter_new = mark_worth_a_look(flag_ordinary(loiter_new, large), "censored").withColumn("dt", F.to_date("start_ts")).cache()
     gaps = flag_regular(gaps_new, history, "end_ts", rv["min_days"], rv["window_days"])
-    gaps = flag_outage(flag_facility(gaps, fac_names), ok_hours, "start_ts", "end_ts").withColumn("dt", F.to_date("end_ts")).cache()
+    gaps = flag_outage(flag_facility(gaps, fac_names), ok_hours, "start_ts", "end_ts")
+    gaps = mark_worth_a_look(flag_ordinary(gaps, large), "feed_outage").withColumn("dt", F.to_date("end_ts")).cache()
     zones, loiter = zones_new, loiter_new   # (zones_new keeps the same rows: the flags only add columns)
     if v_day < s_day:
         zones = union_kept(zones_new, kept_published(spark, P("gold/zone_entries"), "entry_ts", open_visits, v_day, s_day)).cache()
@@ -201,8 +210,8 @@ def main(full=False):
                       F.sum((F.col("minutes_inside") < 0).cast("int")).alias("neg")).collect()[0]
     lo = loiter_new.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs"),
                         F.sum((F.col("duration_min") < sc.get("loiter_min_minutes", 120)).cast("int")).alias("short")).collect()[0]
-    flags = {"loitering_worth_a_look": loiter_new.where("NOT regular_visitor AND NOT is_facility AND NOT censored").count(),
-             "ais_gaps_worth_a_look": gaps.where("NOT regular_visitor AND NOT is_facility AND NOT feed_outage").count()}
+    flags = {"loitering_worth_a_look": loiter_new.where("worth_a_look").count(),
+             "ais_gaps_worth_a_look": gaps.where("worth_a_look").count()}
     g = gaps.agg(F.count("*").alias("n"), F.sum(((F.col("duration_min") * 60 <= gap_min_s) |
                                                  (F.col("duration_min") * 60 > gap_max_s)).cast("int")).alias("bad")).collect()[0]
     _sp.end()

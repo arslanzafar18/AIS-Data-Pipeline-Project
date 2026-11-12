@@ -99,6 +99,10 @@ def build_zone_entries(near: DataFrame, gap_s: int) -> DataFrame:
              .drop("session_no"))
 
 
+def _col_or_null(df, name, typ):
+    return F.col(name) if name in df.columns else F.lit(None).cast(typ)
+
+
 def build_loitering(near: DataFrame, gap_s: int, max_kn: float, min_minutes: float) -> DataFrame:
     """Episodes of a vessel staying slow (< max_kn) within the near radius of one installation for at least
     min_minutes (use case 3). A position without speed counts as not slow."""
@@ -109,7 +113,8 @@ def build_loitering(near: DataFrame, gap_s: int, max_kn: float, min_minutes: flo
                   F.first("shipType", ignorenulls=True).alias("ship_type"),
                   F.min("event_ts").alias("start_ts"), F.max("event_ts").alias("end_ts"),
                   F.min("dist_m").alias("min_dist_m"), F.avg("speedOverGround").alias("avg_sog_kn"),
-                  F.max(F.col("is_at_installation").cast("int")).alias("entered_zone"), F.count("*").alias("n_msgs"))
+                  F.max(F.col("is_at_installation").cast("int")).alias("entered_zone"), F.count("*").alias("n_msgs"),
+                  F.max(_col_or_null(s, "shipLength", "int")).alias("length_m"))
              .withColumn("duration_min", (F.col("end_ts").cast("long") - F.col("start_ts").cast("long")) / 60.0)
              .where(F.col("duration_min") >= min_minutes)
              .withColumn("event_type", F.lit("loitering")).drop("session_no"))
@@ -130,6 +135,7 @@ def build_ais_gaps(pos: DataFrame, min_gap_s: int, max_gap_s: int, since_ts: str
                     & (F.col("event_ts") >= F.to_timestamp(F.lit(since_ts))))
              .select("mmsi", "inst_name", "inst_kind", onshore.alias("is_onshore"),
                      F.col("name").alias("vessel_name"), F.col("shipType").alias("ship_type"),
+                     _col_or_null(p, "shipLength", "int").alias("length_m"),
                      F.col("prev_ts").alias("start_ts"), F.col("event_ts").alias("end_ts"),
                      F.col("prev_inst").alias("start_inst_name"),
                      F.least("prev_dist", "dist_m").alias("min_dist_m"), (gap / 60.0).alias("duration_min"))
@@ -204,3 +210,23 @@ def flag_outage(events: DataFrame, ok_hours: DataFrame, start_col: str, end_col:
             .groupBy("_eid").agg(F.sum(F.col("_ok").isNull().cast("int")).alias("_bad")))
     return (e.join(hrs, "_eid", "left").withColumn("feed_outage", F.coalesce(F.col("_bad"), F.lit(0)) > 0)
              .drop("_eid", "_bad"))
+
+
+def flag_ordinary(events: DataFrame, large_ship_min_m: int) -> DataFrame:
+    """Two kinds of ordinary activity that are not a security concern:
+    terminal_call  - a large ship (length_m >= large_ship_min_m) at an ONSHORE facility, e.g. a tanker waiting to berth;
+    support_craft  - the vessel's name contains the installation's own name, e.g. 'DRAUGEN MOB BOAT' at DRAUGEN."""
+    inst = _norm_name(F.col("inst_name"))
+    return (events
+            .withColumn("terminal_call", F.coalesce(F.col("is_onshore"), F.lit(False))
+                        & F.coalesce(F.col("length_m") >= large_ship_min_m, F.lit(False)))
+            .withColumn("support_craft", F.coalesce((F.length(inst) >= 4)
+                        & (F.instr(_norm_name(F.col("vessel_name")), inst) > 0), F.lit(False))))
+
+
+def mark_worth_a_look(events: DataFrame, data_flag: str) -> DataFrame:
+    """worth_a_look: none of the ordinary explanations applies. data_flag is 'censored' (loitering) or
+    'feed_outage' (AIS gaps)."""
+    ordinary = (F.col("regular_visitor") | F.col("is_facility") | F.col(data_flag)
+                | F.col("terminal_call") | F.col("support_craft"))
+    return events.withColumn("worth_a_look", ~ordinary)

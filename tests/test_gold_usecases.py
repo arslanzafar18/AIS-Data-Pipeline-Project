@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from spark.gold_logic import (build_ais_gaps, build_coverage, build_loitering, build_zone_entries, covered_hours,
-                              flag_censored, flag_facility, flag_outage, flag_regular)
+                              flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
+                              mark_worth_a_look)
 
 SCHEMA = ("mmsi long, inst_name string, inst_kind string, is_onshore boolean, event_ts timestamp, dist_m double, "
           "speedOverGround double, name string, shipType int, is_at_installation boolean, is_near_installation boolean")
@@ -73,3 +74,23 @@ def test_censored_and_feed_outage_follow_hourly_coverage(spark):
     gaps = spark.createDataFrame([(1, h(10, 30), h(12, 10)), (2, h(9, 10), h(10, 50))],
                                  "mmsi long, start_ts timestamp, end_ts timestamp")
     assert {r["mmsi"]: r["feed_outage"] for r in flag_outage(gaps, ok, "start_ts", "end_ts").collect()} == {1: True, 2: False}
+
+
+def test_terminal_calls_and_support_craft_are_ordinary(spark):
+    ev = spark.createDataFrame([
+        (1, "STI ROTHERHITHE", "MONGSTAD", True, 183),       # large tanker at an onshore terminal
+        (2, "SMALL BOAT", "MONGSTAD", True, 15),              # small vessel at a terminal: still checked
+        (3, "UNKNOWN", "MONGSTAD", True, None),              # no length: not treated as large
+        (4, "DRAUGEN MOB BOAT", "DRAUGEN", False, 8),         # carries the installation's own name
+        (5, "ESVAGT FRB76", "EKOFISK K", False, 9),           # rescue boat, other name: still checked
+    ], "mmsi long, vessel_name string, inst_name string, is_onshore boolean, length_m int")
+    out = {r["mmsi"]: (r["terminal_call"], r["support_craft"]) for r in flag_ordinary(ev, 100).collect()}
+    assert out == {1: (True, False), 2: (False, False), 3: (False, False), 4: (False, True), 5: (False, False)}
+
+
+def test_worth_a_look_only_when_no_ordinary_explanation(spark):
+    cols = "mmsi long, regular_visitor boolean, is_facility boolean, censored boolean, terminal_call boolean, support_craft boolean"
+    ev = spark.createDataFrame([(1, False, False, False, False, False), (2, True, False, False, False, False),
+                                (3, False, False, True, False, False), (4, False, False, False, False, True)], cols)
+    assert {r["mmsi"]: r["worth_a_look"] for r in mark_worth_a_look(ev, "censored").collect()} == \
+           {1: True, 2: False, 3: False, 4: False}
