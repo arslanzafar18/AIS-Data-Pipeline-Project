@@ -1,14 +1,68 @@
 name: monitor
 on:
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "7,37 * * * *"      # GitHub runs scheduled jobs best-effort: in practice every few hours
   workflow_dispatch:
+    inputs:
+      test_failure:
+        description: "Pretend the collector heartbeat is stale, to test the alert issue"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write                 # to open, comment on and close the "pipeline-alert" issue
+
 jobs:
   health:
-    runs-on: self-hosted      # reads the heartbeat and Gold manifest on the always-on host
+    runs-on: self-hosted        # reads the heartbeat and Gold manifest on the always-on host
     steps:
-      - name: Collector heartbeat and Gold readiness (a failure notifies the repo owner)
+      - name: Collector heartbeat and Gold readiness
+        shell: bash             # -eo pipefail: the step fails if the check fails, even through tee
         env:
           HEARTBEAT_URL: file:///home/ubuntu/AIS-Data-Pipeline-Project/metrics/prod/heartbeat.json
           GOLD_URL: file:///home/ubuntu/AIS-Data-Pipeline-Project/data/prod/gold/_READY.json
-        run: /home/ubuntu/spark-env/bin/python /home/ubuntu/AIS-Data-Pipeline-Project/scripts/check_heartbeat.py
+          MAX_AGE_SECONDS: ${{ inputs.test_failure && '1' || '600' }}
+        run: |
+          /home/ubuntu/spark-env/bin/python /home/ubuntu/AIS-Data-Pipeline-Project/scripts/check_heartbeat.py 2>&1 \
+            | tee "$RUNNER_TEMP/check.txt"
+
+      # A failed scheduled run only emails one person, so the alert goes to an issue the whole team sees.
+      - name: Open or update the pipeline alert issue
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "Monitor check failed at $(date -u '+%Y-%m-%d %H:%M') UTC."
+            echo
+            echo '```'
+            tail -20 "$RUNNER_TEMP/check.txt" 2>/dev/null || echo "(no output captured)"
+            echo '```'
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            echo "cc @arslanzafar18 @okotb1"
+          } > "$RUNNER_TEMP/body.md"
+          n=$(gh issue list --state open --label pipeline-alert --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh label create pipeline-alert --color B60205 --description "Opened by the monitor workflow" 2>/dev/null || true
+            gh issue create --title "Pipeline alert: monitor check failing" --label pipeline-alert \
+              --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+      - name: Close the alert issue once healthy again
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for n in $(gh issue list --state open --label pipeline-alert --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Checks pass again at $(date -u '+%Y-%m-%d %H:%M') UTC."
+          done
