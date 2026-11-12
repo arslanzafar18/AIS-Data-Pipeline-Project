@@ -27,3 +27,46 @@ def build_hourly(near: DataFrame) -> DataFrame:
                 .agg(F.countDistinct("mmsi").alias("distinct_vessels"), _onshore(near), F.count("*").alias("position_msgs"),
                      F.sum(F.col("is_at_installation").cast("int")).alias("msgs_in_zone"),
                      F.avg("speedOverGround").alias("avg_sog_kn")))
+
+
+def _latest(c, order="event_ts"):
+    """Most recent non-null value of column c (AIS identity fields are often missing in single messages)."""
+    return F.max_by(F.col(c), F.when(F.col(c).isNotNull(), F.col(order)))
+
+
+def build_vessel_days(pos: DataFrame) -> DataFrame:
+    """One row per vessel per day, from ALL Silver positions (not only near installations)."""
+    return (pos.groupBy("mmsi", "dt")
+               .agg(F.count("*").alias("n_msgs"), F.min("event_ts").alias("first_ts"), F.max("event_ts").alias("last_ts"),
+                    F.sum(F.col("is_near_installation").cast("int")).alias("n_near"),
+                    F.sum(F.col("is_at_installation").cast("int")).alias("n_zone"),
+                    F.countDistinct("inst_name").alias("installations"),
+                    _latest("name").alias("name"), _latest("shipType").alias("ship_type"),
+                    _latest("callSign").alias("call_sign"), _latest("imo").alias("imo"),
+                    _latest("shipLength").alias("length_m"), _latest("destination").alias("destination")))
+
+
+def build_vessels(vessel_days: DataFrame) -> DataFrame:
+    """One row per vessel: latest identity, first and last seen, totals. Built from vessel_days (small)."""
+    latest = lambda c: F.max_by(F.col(c), F.when(F.col(c).isNotNull(), F.col("last_ts"))).alias(c)
+    return (vessel_days.groupBy("mmsi")
+                       .agg(F.min("first_ts").alias("first_seen"), F.max("last_ts").alias("last_seen"),
+                            F.countDistinct("dt").alias("days_seen"), F.sum("n_msgs").alias("n_msgs"),
+                            F.sum("n_near").alias("n_near"), F.sum("n_zone").alias("n_zone"),
+                            *[latest(c) for c in ("name", "ship_type", "call_sign", "imo", "length_m", "destination")]))
+
+
+def build_installations(spark, cfg, path) -> DataFrame:
+    """One row per installation in the facility filter, with its field, phase and position (from Bronze)."""
+    from spark.common import filter_facilities
+    df = spark.read.option("header", True).csv(path)
+    kind, name = cfg.get("facility_kind_col", "fclKind"), cfg.get("facility_name_col", "fclName")
+    df = filter_facilities(df, cfg.get("facility_filter"), kind)
+    col = lambda c, alias: (F.col(c) if c in df.columns else F.lit(None).cast("string")).alias(alias)
+    onshore = (F.coalesce(F.col(kind).isin(cfg.get("onshore_kinds", ["ONSHORE FACILITY"])), F.lit(False))
+               if kind in df.columns else F.lit(False))
+    return (df.select(col(name, "inst_name"), col(kind, "inst_kind"), col("belong2nm", "field"),
+                      col("phaseName", "phase"), col("FixMov", "fixed_or_moveable"), onshore.alias("is_onshore"),
+                      F.col("centroid_lat").cast("double").alias("lat"), F.col("centroid_lon").cast("double").alias("lon"))
+              .where("inst_name is not null and lat is not null and lon is not null")
+              .dropDuplicates(["inst_name"]))
