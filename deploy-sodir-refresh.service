@@ -1,0 +1,12 @@
+[Unit]
+Description=Sodir facilities refresh into Bronze (weekly, run by deploy-sodir-refresh.timer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/AIS-Data-Pipeline-Project
+EnvironmentFile=/home/ubuntu/AIS-Data-Pipeline-Project/.env
+Environment=PYTHONPATH=/home/ubuntu/AIS-Data-Pipeline-Project
+ExecStart=/home/ubuntu/spark-env/bin/python reference/fetch_sodir.py
