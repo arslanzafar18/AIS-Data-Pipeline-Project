@@ -62,3 +62,11 @@ def test_swap_dir_replaces_whole_table(tmp_path):
     _mk(tmp_path / "t", "old"); _mk(tmp_path / "new", "fresh")
     gp.swap_dir(str(tmp_path / "new"), str(tmp_path / "t"))
     assert os.listdir(tmp_path / "t") == ["fresh"] and not (tmp_path / "_prev_t").exists()
+
+
+def test_has_data_ignores_empty_tables_and_hidden_folders(tmp_path):
+    os.makedirs(tmp_path / "empty"); open(tmp_path / "empty" / "_SUCCESS", "w").close()
+    _mk(tmp_path / "hidden" / "_prev_dt=2026-11-11", "part-0.parquet")
+    _mk(tmp_path / "full" / "dt=2026-11-12", "part-0.parquet")
+    assert not gp.has_data(str(tmp_path / "empty")) and not gp.has_data(str(tmp_path / "hidden"))
+    assert gp.has_data(str(tmp_path / "full")) and not gp.has_data(str(tmp_path / "missing"))

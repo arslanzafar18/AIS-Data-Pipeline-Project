@@ -24,6 +24,13 @@
     "min_days": 3,
     "window_days": 30
   },
+  "zone_gap_s": 1800,
+  "surveillance": {
+    "loiter_max_kn": 2.0,
+    "loiter_min_minutes": 120,
+    "ais_gap_min_minutes": 30,
+    "ais_gap_max_hours": 12
+  },
   "gold_shuffle_partitions": null,
   "gate": {
     "min_silver_rows": 100,
