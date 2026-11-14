@@ -11,6 +11,7 @@ Gold job: builds consumer tables from Silver and PUBLISHES THEM ONLY IF QUALITY 
   gold/ais_gap_events                vessel silent >= ais_gap_min_minutes between two positions near an
                                      installation, nothing sent anywhere in between             (by end day)
   gold/feed_coverage_hourly          messages and vessels per hour over all positions          (by day)
+  gold/vessel_tracks                 latest position per vessel per track_slot_s (10 min)      (by day)
   Event tables carry: regular_visitor (present at that installation on >= regular_visitor.min_days distinct days
   in the regular_visitor.window_days before the event), is_facility (the "vessel" is a platform or rig in Sodir's
   list broadcasting AIS; floating units such as FPSOs and rigs only while stationary), censored (started right after a feed gap or the start of the data), for AIS gaps
@@ -36,13 +37,13 @@ import pipeline_config
 from spark import gold_plan as plan
 from spark.gold_logic import (build_ais_gaps, build_coverage, build_hourly, build_installations, build_loitering,
                               build_vessel_days, build_vessels, build_visits, build_zone_entries, covered_hours,
-                              flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
+                              build_vessel_tracks, flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
                               mark_worth_a_look)
 from spark.session import get_spark
 
 PARTITIONED = ("vessel_visits", "installation_activity_hourly", "vessel_days",
-               "zone_entries", "loitering_events", "ais_gap_events", "feed_coverage_hourly")
-LAYOUT = "dt-partitioned-v5"      # bump when tables are added or change shape: the next run is then a full rebuild
+               "zone_entries", "loitering_events", "ais_gap_events", "feed_coverage_hourly", "vessel_tracks")
+LAYOUT = "dt-partitioned-v6"      # bump when tables are added or change shape: the next run is then a full rebuild
 REBUILT_FROM_OPEN_VISITS = {"vessel_visits": "arrival_ts", "zone_entries": "entry_ts", "loitering_events": "start_ts"}
 DIMENSIONS = ("vessels", "installations")
 
@@ -148,6 +149,7 @@ def main(full=False):
     hourly = build_hourly(near).withColumn("dt", F.to_date("hour_ts")).cache()
     vdays = build_vessel_days(read).cache()
     coverage = build_coverage(read).cache()
+    tracks = build_vessel_tracks(read, int(cfg.get("track_slot_s", 600))).cache()
 
     # ---- use cases 2 and 3: zone entries, loitering, AIS gaps --------------------------------------------
     sc, rv = cfg.get("surveillance", {}), cfg.get("regular_visitor", {"min_days": 3, "window_days": 30})
@@ -210,7 +212,9 @@ def main(full=False):
     _sp.end(); _sp = obs.start("gold.build_hourly")
     h = hourly.agg(F.count("*").alias("n"), F.sum("position_msgs").alias("msgs"), F.sum("msgs_in_zone").alias("zone")).collect()[0]
     _sp.end(); _sp = obs.start("gold.build_vessel_days")
-    d = vdays.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs")).collect()[0]
+    d = vdays.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs"), F.countDistinct("mmsi").alias("vessels")).collect()[0]
+    tr = tracks.agg(F.count("*").alias("n"), F.countDistinct("mmsi").alias("vessels"),
+                    F.sum((F.col("lat").isNull() | F.col("lon").isNull()).cast("int")).alias("nopos")).collect()[0]
     _sp.end(); _sp = obs.start("gold.build_events")
     z = zones_new.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs"),
                       F.sum((F.col("minutes_inside") < 0).cast("int")).alias("neg")).collect()[0]
@@ -242,6 +246,9 @@ def main(full=False):
         f"zone entries={z['msgs']} silver={sv['zone_v']} negative={z['neg']}")
     chk("events_within_rules", (lo["msgs"] or 0) <= (sv["near_v"] or 0) and (lo["short"] or 0) == 0 and (g["bad"] or 0) == 0,
         f"loitering={lo['n']} (too short {lo['short']}), ais gaps={g['n']} (out of range {g['bad']})")
+    chk("vessel_tracks_cover_every_vessel", (tr["n"] or 0) <= n_s and (tr["nopos"] or 0) == 0
+        and (tr["vessels"] or 0) == (d["vessels"] or 0),
+        f"tracks={tr['n']} rows for {tr['vessels']} vessels (vessel_days {d['vessels']}), missing positions={tr['nopos']}")
     chk("no_negative_durations_or_null_keys", (v["neg"] or 0) == 0 and (v["nullkeys"] or 0) == 0, f"neg={v['neg']} nullkeys={v['nullkeys']}")
     ok = all(c["passed"] for c in checks)
 
@@ -252,7 +259,8 @@ def main(full=False):
                 "open_visits_rebuilt": open_visits.count() if open_visits is not None else 0,
                 "silver_max_event_ts": str(s["max_ts"]),
                 "recomputed": {"vessel_visits": v["n"], "installation_activity_hourly": h["n"], "vessel_days": d["n"],
-                               "zone_entries": z["n"], "loitering_events": lo["n"], "ais_gap_events": g["n"]},
+                               "zone_entries": z["n"], "loitering_events": lo["n"], "ais_gap_events": g["n"],
+                               "vessel_tracks": tr["n"]},
                 "events_worth_a_look_recomputed": flags, "checks": checks}
     obs.annotate(run_id=run_id, silver_rows=n_s, vessel_visits=v["n"], hourly_rows=h["n"], gate_passed=ok,
                  failed_checks=[c["check"] for c in checks if not c["passed"]])
@@ -275,6 +283,7 @@ def main(full=False):
     loiter.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/loitering_events")
     gaps.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/ais_gap_events")
     coverage.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/feed_coverage_hourly")
+    tracks.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/vessel_tracks")
     days = {t: plan.days_between(v_day, max_dt) for t in REBUILT_FROM_OPEN_VISITS}
     for t in PARTITIONED:
         if full:

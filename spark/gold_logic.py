@@ -251,3 +251,16 @@ def mark_worth_a_look(events: DataFrame, data_flag: str) -> DataFrame:
     ordinary = (F.col("regular_visitor") | F.col("is_facility") | F.col(data_flag)
                 | F.col("terminal_call") | F.col("support_craft"))
     return events.withColumn("worth_a_look", ~ordinary)
+
+
+# ---- use case 4: vessel profile ------------------------------------------------------------------------------------
+
+def build_vessel_tracks(pos: DataFrame, slot_s: int) -> DataFrame:
+    """A thinned track: the latest position of each vessel in each slot_s-second slot (default 10 min), small enough
+    to draw a ship's route on a map over weeks."""
+    slot = F.from_unixtime((F.unix_timestamp("event_ts") / slot_s).cast("long") * slot_s).cast("timestamp")
+    cols = [F.col("event_ts"), F.col("latitude").alias("lat"), F.col("longitude").alias("lon"),
+            F.col("speedOverGround").alias("sog_kn"), F.col("courseOverGround").alias("cog")]
+    cols += [F.col(c) for c in ("inst_name", "dist_m", "is_at_installation") if c in pos.columns]
+    return (pos.groupBy("mmsi", slot.alias("slot_ts")).agg(F.max_by(F.struct(*cols), F.col("event_ts")).alias("p"))
+               .select("mmsi", "slot_ts", "p.*").withColumn("dt", F.to_date("slot_ts")))
