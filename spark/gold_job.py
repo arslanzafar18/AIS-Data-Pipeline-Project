@@ -11,6 +11,10 @@ Gold job: builds consumer tables from Silver and PUBLISHES THEM ONLY IF QUALITY 
   gold/ais_gap_events                vessel silent >= ais_gap_min_minutes between two positions near an
                                      installation, nothing sent anywhere in between             (by end day)
   gold/feed_coverage_hourly          messages and vessels per hour over all positions          (by day)
+  gold/vessel_tracks                 latest position per vessel per track_slot_s (10 min)      (by day)
+  gold/helicopter_landings           aircraft (SAR MMSI 111xxxxxx or altitude reported) inside a 500 m zone (by day)
+  Aircraft are left out of visits, hourly activity, zone entries and surveillance events.
+  Warnings (Gold still publishes): speed glitches above gate.max_sog_glitch_rate of positions in the last 24 h.
   Event tables carry: regular_visitor (present at that installation on >= regular_visitor.min_days distinct days
   in the regular_visitor.window_days before the event), is_facility (the "vessel" is a platform or rig in Sodir's
   list broadcasting AIS; floating units such as FPSOs and rigs only while stationary), censored (started right after a feed gap or the start of the data), for AIS gaps
@@ -36,13 +40,13 @@ import pipeline_config
 from spark import gold_plan as plan
 from spark.gold_logic import (build_ais_gaps, build_coverage, build_hourly, build_installations, build_loitering,
                               build_vessel_days, build_vessels, build_visits, build_zone_entries, covered_hours,
-                              flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
+                              build_vessel_tracks, with_position_flags, flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
                               mark_worth_a_look)
 from spark.session import get_spark
 
 PARTITIONED = ("vessel_visits", "installation_activity_hourly", "vessel_days",
-               "zone_entries", "loitering_events", "ais_gap_events", "feed_coverage_hourly")
-LAYOUT = "dt-partitioned-v5"      # bump when tables are added or change shape: the next run is then a full rebuild
+               "zone_entries", "loitering_events", "ais_gap_events", "feed_coverage_hourly", "vessel_tracks", "helicopter_landings")
+LAYOUT = "dt-partitioned-v7"      # bump when tables are added or change shape: the next run is then a full rebuild
 REBUILT_FROM_OPEN_VISITS = {"vessel_visits": "arrival_ts", "zone_entries": "entry_ts", "loitering_events": "start_ts"}
 DIMENSIONS = ("vessels", "installations")
 
@@ -66,6 +70,19 @@ def read_table(spark, path):
 
 def union_kept(new, kept):
     return new if kept is None else new.unionByName(kept)
+
+
+def glitch_rate(path, hours=24):
+    """Share of accepted Silver positions whose speed was nulled as a glitch, over the last `hours`."""
+    if not os.path.exists(path):
+        return None, 0
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    g = n = 0
+    for line in open(path):
+        m = json.loads(line)
+        if datetime.fromisoformat(m["processed_at"]) >= since:
+            g += m.get("corrected_sog_glitch", 0) or 0; n += m.get("valid_rows", 0) or 0
+    return (g / n if n else None), n
 
 
 def kept_published(spark, path, ts_col, open_visits, v_day, s_day):
@@ -124,17 +141,18 @@ def main(full=False):
     _sp.end()
 
     # ---- read Silver: every row from S; before S only the rows of the visits still open at S ---------------
-    base = spark.read.option("mergeSchema", "true").parquet(P("silver/positions"))
+    base = with_position_flags(spark.read.option("mergeSchema", "true").parquet(P("silver/positions")))
     raw = base.where((F.col("dt") >= F.lit(s_day)) & (F.col("dt") <= F.lit(max_dt)))
     if full:      # whole window: Silver already dedupes across batches, so skip the full-table shuffle
         read, raw_n = raw, None
     else:         # a few days: deduplicate as a safety net, it is cheap at this size
         raw_n = raw.count()
         read = raw.dropDuplicates(["mmsi", "event_ts"]).persist(StorageLevel.MEMORY_AND_DISK)
-    near = read.where("is_near_installation").cache()
+    near = read.where("is_near_installation AND NOT is_aircraft").cache()     # ships only
     near_v = near
     if v_day < s_day:
-        early = (base.where((F.col("dt") >= F.lit(v_day)) & (F.col("dt") < F.lit(s_day)) & F.col("is_near_installation"))
+        early = (base.where((F.col("dt") >= F.lit(v_day)) & (F.col("dt") < F.lit(s_day)) & F.col("is_near_installation")
+                            & ~F.col("is_aircraft"))
                      .join(F.broadcast(open_visits), ["mmsi", "inst_name"])
                      .where(F.col("event_ts") >= F.col("open_from")).drop("open_from")
                      .dropDuplicates(["mmsi", "event_ts"]))
@@ -148,6 +166,7 @@ def main(full=False):
     hourly = build_hourly(near).withColumn("dt", F.to_date("hour_ts")).cache()
     vdays = build_vessel_days(read).cache()
     coverage = build_coverage(read).cache()
+    tracks = build_vessel_tracks(read, int(cfg.get("track_slot_s", 600))).cache()
 
     # ---- use cases 2 and 3: zone entries, loitering, AIS gaps --------------------------------------------
     sc, rv = cfg.get("surveillance", {}), cfg.get("regular_visitor", {"min_days": 3, "window_days": 30})
@@ -160,8 +179,13 @@ def main(full=False):
                         "name", "shipType", "shipLength", "speedOverGround") if c in read.columns]
     before = (base.where((F.col("dt") == F.date_sub(F.lit(s_day), 1))     # each vessel's messages just before S
                   & (F.col("event_ts") >= F.to_timestamp(F.lit(s_start_ts)) - F.expr(f"INTERVAL {gap_max_s} SECONDS")))
-                  .select(*cols).dropDuplicates(["mmsi", "event_ts"]))
-    gaps_new = build_ais_gaps(read.select(*cols).unionByName(before), gap_min_s, gap_max_s, s_start_ts)
+                  .select(*(cols + ["is_aircraft"])).dropDuplicates(["mmsi", "event_ts"]))
+    gaps_new = build_ais_gaps(read.where("NOT is_aircraft").select(*cols).unionByName(before.where(~F.col("is_aircraft")).select(*cols)),
+                              gap_min_s, gap_max_s, s_start_ts)
+    # aircraft (SAR helicopters) inside a 500 m zone: helideck landings, kept apart from ship traffic
+    landings = (build_zone_entries(read.where("is_near_installation AND is_aircraft"), zone_gap)
+                .withColumnRenamed("entry_ts", "arrival_ts").withColumnRenamed("exit_ts", "departure_ts")
+                .withColumnRenamed("minutes_inside", "minutes_in_zone").withColumn("dt", F.to_date("arrival_ts")).cache())
     history = visits                                                           # visits used for the regular-visitor flag
     older = None if full else read_table(spark, P("gold/vessel_visits"))
     if older is not None:
@@ -199,9 +223,13 @@ def main(full=False):
         loiter = union_kept(loiter_new, kept_published(spark, P("gold/loitering_events"), "start_ts", open_visits, v_day, s_day)).cache()
 
     _sp = obs.start("gold.silver_stats")
+    ship, air = ~F.col("is_aircraft"), F.col("is_aircraft")
     s = read.agg(F.count("*").alias("n"), F.max("event_ts").alias("max_ts"),
-                 F.sum(F.col("is_near_installation").cast("int")).alias("near_s"),
-                 F.sum(F.col("is_at_installation").cast("int")).alias("zone_s")).collect()[0]
+                 F.sum((F.col("is_near_installation") & ship).cast("int")).alias("near_s"),
+                 F.sum((F.col("is_at_installation") & ship).cast("int")).alias("zone_s"),
+                 F.sum((F.col("is_at_installation") & air).cast("int")).alias("zone_air"),
+                 F.sum(air.cast("int")).alias("aircraft_rows"), F.sum(F.col("sog_glitch").cast("int")).alias("glitches")).collect()[0]
+    hl = landings.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs")).collect()[0]
     sv = near_v.agg(F.count("*").alias("near_v"), F.sum(F.col("is_at_installation").cast("int")).alias("zone_v")).collect()[0]
     _sp.end(); _sp = obs.start("gold.build_visits")
     v = visits_new.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs"), F.sum("msgs_in_zone").alias("zone"),
@@ -210,7 +238,9 @@ def main(full=False):
     _sp.end(); _sp = obs.start("gold.build_hourly")
     h = hourly.agg(F.count("*").alias("n"), F.sum("position_msgs").alias("msgs"), F.sum("msgs_in_zone").alias("zone")).collect()[0]
     _sp.end(); _sp = obs.start("gold.build_vessel_days")
-    d = vdays.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs")).collect()[0]
+    d = vdays.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs"), F.countDistinct("mmsi").alias("vessels")).collect()[0]
+    tr = tracks.agg(F.count("*").alias("n"), F.countDistinct("mmsi").alias("vessels"),
+                    F.sum((F.col("lat").isNull() | F.col("lon").isNull()).cast("int")).alias("nopos")).collect()[0]
     _sp.end(); _sp = obs.start("gold.build_events")
     z = zones_new.agg(F.count("*").alias("n"), F.sum("n_msgs").alias("msgs"),
                       F.sum((F.col("minutes_inside") < 0).cast("int")).alias("neg")).collect()[0]
@@ -222,6 +252,11 @@ def main(full=False):
                                                  (F.col("duration_min") * 60 > gap_max_s)).cast("int")).alias("bad")).collect()[0]
     _sp.end()
     rr, rr_in = silver_reject_rate(cfg, P("quality/silver_metrics.jsonl"), cfg["lookback_days"])
+    gr, gr_n = glitch_rate(P("quality/silver_metrics.jsonl"))
+    warnings = []
+    if gr is not None and gr > gate.get("max_sog_glitch_rate", 0.001):
+        warnings.append(f"speed glitches (> {cfg.get('max_ship_kn', 50)} kn, nulled) are {gr:.4%} of {gr_n} positions in the "
+                        f"last 24 h, above {gate.get('max_sog_glitch_rate', 0.001):.2%}: check the feed or a faulty transponder")
 
     # ---- quality gate: every recomputed table must reconcile with Silver for the same days ---------------
     checks = []
@@ -242,6 +277,11 @@ def main(full=False):
         f"zone entries={z['msgs']} silver={sv['zone_v']} negative={z['neg']}")
     chk("events_within_rules", (lo["msgs"] or 0) <= (sv["near_v"] or 0) and (lo["short"] or 0) == 0 and (g["bad"] or 0) == 0,
         f"loitering={lo['n']} (too short {lo['short']}), ais gaps={g['n']} (out of range {g['bad']})")
+    chk("vessel_tracks_cover_every_vessel", (tr["n"] or 0) <= n_s and (tr["nopos"] or 0) == 0
+        and (tr["vessels"] or 0) == (d["vessels"] or 0),
+        f"tracks={tr['n']} rows for {tr['vessels']} vessels (vessel_days {d['vessels']}), missing positions={tr['nopos']}")
+    chk("helicopter_landing_msgs_equal_silver_aircraft_zone_rows", (hl["msgs"] or 0) == (s["zone_air"] or 0),
+        f"landings={hl['n']} ({hl['msgs']} msgs) silver aircraft in zones={s['zone_air']}")
     chk("no_negative_durations_or_null_keys", (v["neg"] or 0) == 0 and (v["nullkeys"] or 0) == 0, f"neg={v['neg']} nullkeys={v['nullkeys']}")
     ok = all(c["passed"] for c in checks)
 
@@ -252,8 +292,12 @@ def main(full=False):
                 "open_visits_rebuilt": open_visits.count() if open_visits is not None else 0,
                 "silver_max_event_ts": str(s["max_ts"]),
                 "recomputed": {"vessel_visits": v["n"], "installation_activity_hourly": h["n"], "vessel_days": d["n"],
-                               "zone_entries": z["n"], "loitering_events": lo["n"], "ais_gap_events": g["n"]},
-                "events_worth_a_look_recomputed": flags, "checks": checks}
+                               "zone_entries": z["n"], "loitering_events": lo["n"], "ais_gap_events": g["n"],
+                               "vessel_tracks": tr["n"], "helicopter_landings": hl["n"]},
+                "events_worth_a_look_recomputed": flags, "aircraft_rows": s["aircraft_rows"], "sog_glitches": s["glitches"],
+                "sog_glitch_rate_24h": gr, "warnings": warnings, "checks": checks}
+    for w in warnings:
+        obs.event("warning", detail=w); print("WARNING:", w)
     obs.annotate(run_id=run_id, silver_rows=n_s, vessel_visits=v["n"], hourly_rows=h["n"], gate_passed=ok,
                  failed_checks=[c["check"] for c in checks if not c["passed"]])
     for c in checks:
@@ -275,6 +319,8 @@ def main(full=False):
     loiter.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/loitering_events")
     gaps.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/ais_gap_events")
     coverage.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/feed_coverage_hourly")
+    tracks.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/vessel_tracks")
+    landings.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/helicopter_landings")
     days = {t: plan.days_between(v_day, max_dt) for t in REBUILT_FROM_OPEN_VISITS}
     for t in PARTITIONED:
         if full:
@@ -283,7 +329,8 @@ def main(full=False):
             plan.swap_partitions(f"{stage}/{t}", P(f"gold/{t}"), days.get(t, plan.days_between(s_day, max_dt)))
         plan.drop_partitions_before(P(f"gold/{t}"), window_start)
     flag_facility(build_vessels(spark.read.parquet(P("gold/vessel_days")) if plan.has_data(P("gold/vessel_days"))
-                                else vdays), fac_names, "name").write.mode("overwrite").parquet(f"{stage}/vessels")
+                                else vdays, sc.get("faulty_speed_min_count", 10), sc.get("faulty_speed_min_share", 0.01)),
+                  fac_names, "name").write.mode("overwrite").parquet(f"{stage}/vessels")
     build_installations(spark, cfg, P("bronze/reference/facilities.csv")).write.mode("overwrite").parquet(f"{stage}/installations")
     for t in DIMENSIONS:
         plan.swap_dir(f"{stage}/{t}", P(f"gold/{t}"))
@@ -303,8 +350,7 @@ def main(full=False):
         from spark.common import load_facilities
         with obs.span("gold.dashboard"):
             fac = load_facilities(spark, dict(cfg, facility_filter=None), P("bronze/reference/facilities.csv"))
-            dashboard.build(spark.read.parquet(P("gold/vessel_visits")),
-                            spark.read.parquet(P("gold/installation_activity_hourly")), manifest, P("gold/dashboard"), fac=fac)
+            dashboard.build_from_gold(spark, P("gold"), manifest, P("gold/dashboard"), cfg, fac=fac)
     except Exception as e:
         print(f"dashboard not updated: {e!r}")
 
