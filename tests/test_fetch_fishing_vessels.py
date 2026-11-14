@@ -42,3 +42,19 @@ def test_missing_call_sign_is_empty_and_field_check():
         raise AssertionError("should refuse")
     except SystemExit as e:
         assert "NOT replaced" in str(e)
+
+
+def test_page_size_falls_back_when_the_api_says_too_large():
+    import urllib.error
+    data = [vessel(i) for i in range(1, 6)]
+
+    def fake_get(url):
+        size = int(url.split("per_page=")[1])
+        if size > 100:
+            raise urllib.error.HTTPError(url, 400, "Bad Request", {}, None)
+        page = int(url.split("page=")[1].split("&")[0])
+        return data[(page - 1) * size: page * size], 5
+
+    assert F.choose_page_size(fake_get) == 100
+    pages, total = F.fetch_pages(get=fake_get)
+    assert total == 5 and sum(len(p) for p in pages) == 5

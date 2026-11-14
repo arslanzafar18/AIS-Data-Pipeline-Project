@@ -18,12 +18,12 @@ Stdlib only.   Run:  APP_ENV=prod PYTHONPATH=. python reference/fetch_fishing_ve
 import sys
 from pathlib import Path as _P
 sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
-import csv, json, os, time, urllib.parse, urllib.request
+import csv, json, os, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 API = "https://api.fiskeridir.no/vessel-api/api/v1/vessels"
-PER_PAGE = 500
+PAGE_SIZES = (500, 200, 100, 50, 30)   # the API rejects pages that are too large (HTTP 400); the first size it accepts is used
 MAX_PAGES = 1000
 MIN_ROW_RATIO = 0.8
 NEEDED = ["id", "radioCallSign", "name", "length"]
@@ -38,17 +38,38 @@ def _get(url, tries=4):
             with urllib.request.urlopen(req, timeout=60) as r:
                 total = r.headers.get("x-totalcount")
                 return json.load(r), (int(total) if total and total.isdigit() else None)
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500 or k == tries - 1:      # a client error does not get better by retrying
+                raise
+            time.sleep(5 * 2 ** k)
         except Exception:
             if k == tries - 1:
                 raise
             time.sleep(5 * 2 ** k)
 
 
-def fetch_pages(get=_get, per_page=PER_PAGE):
+def page_url(page, per_page):
+    return f"{API}?{urllib.parse.urlencode({'page': page, 'per_page': per_page})}"
+
+
+def choose_page_size(get=_get, sizes=PAGE_SIZES):
+    """The largest page size the API accepts, tried on page 1."""
+    for size in sizes:
+        try:
+            get(page_url(1, size))
+            return size
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+    raise SystemExit(f"The vessel API rejected every page size {sizes}; fishing_vessels.csv NOT replaced.")
+
+
+def fetch_pages(get=_get, per_page=None):
     """All pages until the reported total is reached or a page comes back empty."""
+    per_page = per_page or choose_page_size(get)
     pages, seen, total = [], 0, None
     for page in range(1, MAX_PAGES + 1):
-        items, t = get(f"{API}?{urllib.parse.urlencode({'page': page, 'per_page': per_page})}")
+        items, t = get(page_url(page, per_page))
         total = t if t is not None else total
         if not items:
             break
@@ -102,6 +123,7 @@ def main():
     fetched_at = now.isoformat()
 
     pages, total = fetch_pages()
+    print(f"fetched {sum(len(p) for p in pages)} vessels in {len(pages)} pages (reported total {total})")
     pages = [strip_personal(p) for p in pages]
     items = [it for p in pages for it in p]
     check_fields(items)
