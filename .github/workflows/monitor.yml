@@ -17,12 +17,16 @@ jobs:
   health:
     runs-on: self-hosted        # reads the heartbeat and Gold manifest on the always-on host
     steps:
-      - name: Collector heartbeat and Gold readiness
+      - name: Collector heartbeat, Gold readiness, disk space, message volume
         shell: bash             # -eo pipefail: the step fails if the check fails, even through tee
         env:
           HEARTBEAT_URL: file:///home/ubuntu/AIS-Data-Pipeline-Project/metrics/prod/heartbeat.json
           GOLD_URL: file:///home/ubuntu/AIS-Data-Pipeline-Project/data/prod/gold/_READY.json
           MAX_AGE_SECONDS: ${{ inputs.test_failure && '1' || '600' }}
+          DATA_DIR: /home/ubuntu/AIS-Data-Pipeline-Project/data/prod
+          MIN_FREE_PCT: "15"                         # alert when the data disk has less than 15% free
+          EVENTS_PATH: /home/ubuntu/AIS-Data-Pipeline-Project/metrics/prod/events.jsonl
+          VOLUME_MIN_FRACTION: "0.5"                 # alert when the last hour has under half the usual messages
         run: |
           /home/ubuntu/spark-env/bin/python /home/ubuntu/AIS-Data-Pipeline-Project/scripts/check_heartbeat.py 2>&1 \
             | tee "$RUNNER_TEMP/check.txt"

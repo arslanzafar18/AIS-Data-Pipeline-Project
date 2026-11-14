@@ -1,0 +1,10 @@
+[Unit]
+Description=Delete live Bronze files older than bronze_retention_days that Silver has processed (run by deploy-bronze-retention.timer)
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/AIS-Data-Pipeline-Project
+EnvironmentFile=/home/ubuntu/AIS-Data-Pipeline-Project/.env
+Environment=PYTHONPATH=/home/ubuntu/AIS-Data-Pipeline-Project
+ExecStart=/home/ubuntu/spark-env/bin/python scripts/bronze_retention.py --apply
