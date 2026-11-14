@@ -34,10 +34,27 @@ def _latest(c, order="event_ts"):
     return F.max_by(F.col(c), F.when(F.col(c).isNotNull(), F.col(order)))
 
 
+AIRCRAFT_MMSI = (111000000, 111999999)     # ITU: MMSIs 111MIDxxx are search-and-rescue aircraft
+
+
+def with_position_flags(pos: DataFrame) -> DataFrame:
+    """Ensures is_aircraft and sog_glitch exist (Silver written before they were added lacks them):
+    is_aircraft from the SAR-aircraft MMSI range or a reported altitude; sog_glitch false when unknown."""
+    by_mmsi = F.col("mmsi").between(*AIRCRAFT_MMSI)
+    air = F.coalesce(F.col("is_aircraft"), F.lit(False)) | by_mmsi if "is_aircraft" in pos.columns else by_mmsi
+    if "altitude" in pos.columns:
+        air = air | F.col("altitude").isNotNull()
+    glitch = F.coalesce(F.col("sog_glitch"), F.lit(False)) if "sog_glitch" in pos.columns else F.lit(False)
+    return pos.withColumn("is_aircraft", air).withColumn("sog_glitch", glitch)
+
+
 def build_vessel_days(pos: DataFrame) -> DataFrame:
     """One row per vessel per day, from ALL Silver positions (not only near installations)."""
+    glitch = F.col("sog_glitch") if "sog_glitch" in pos.columns else F.lit(False)
+    air = F.col("is_aircraft") if "is_aircraft" in pos.columns else F.lit(False)
     return (pos.groupBy("mmsi", "dt")
-               .agg(F.count("*").alias("n_msgs"), F.min("event_ts").alias("first_ts"), F.max("event_ts").alias("last_ts"),
+               .agg(F.count("*").alias("n_msgs"), F.sum(glitch.cast("int")).alias("n_sog_glitch"),
+                    F.max(air.cast("int")).cast("boolean").alias("is_aircraft"), F.min("event_ts").alias("first_ts"), F.max("event_ts").alias("last_ts"),
                     F.sum(F.col("is_near_installation").cast("int")).alias("n_near"),
                     F.sum(F.col("is_at_installation").cast("int")).alias("n_zone"),
                     F.countDistinct("inst_name").alias("installations"),
@@ -46,14 +63,21 @@ def build_vessel_days(pos: DataFrame) -> DataFrame:
                     _latest("shipLength").alias("length_m"), _latest("destination").alias("destination")))
 
 
-def build_vessels(vessel_days: DataFrame) -> DataFrame:
-    """One row per vessel: latest identity, first and last seen, totals. Built from vessel_days (small)."""
+def build_vessels(vessel_days: DataFrame, faulty_min_count: int = 10, faulty_min_share: float = 0.01) -> DataFrame:
+    """One row per vessel: latest identity, first and last seen, totals. Built from vessel_days (small).
+    faulty_speed: at least faulty_min_count speed glitches (> max_ship_kn, nulled in Silver) making up at least
+    faulty_min_share of its messages, i.e. a GPS or transponder that keeps reporting impossible speeds."""
     latest = lambda c: F.max_by(F.col(c), F.when(F.col(c).isNotNull(), F.col("last_ts"))).alias(c)
-    return (vessel_days.groupBy("mmsi")
-                       .agg(F.min("first_ts").alias("first_seen"), F.max("last_ts").alias("last_seen"),
-                            F.countDistinct("dt").alias("days_seen"), F.sum("n_msgs").alias("n_msgs"),
-                            F.sum("n_near").alias("n_near"), F.sum("n_zone").alias("n_zone"),
-                            *[latest(c) for c in ("name", "ship_type", "call_sign", "imo", "length_m", "destination")]))
+    col = lambda c, t: F.col(c) if c in vessel_days.columns else F.lit(None).cast(t)
+    v = (vessel_days.groupBy("mmsi")
+                    .agg(F.min("first_ts").alias("first_seen"), F.max("last_ts").alias("last_seen"),
+                         F.countDistinct("dt").alias("days_seen"), F.sum("n_msgs").alias("n_msgs"),
+                         F.sum("n_near").alias("n_near"), F.sum("n_zone").alias("n_zone"),
+                         F.coalesce(F.sum(col("n_sog_glitch", "long")), F.lit(0)).alias("sog_glitches"),
+                         F.coalesce(F.max(col("is_aircraft", "boolean").cast("int")), F.lit(0)).cast("boolean").alias("is_aircraft"),
+                         *[latest(c) for c in ("name", "ship_type", "call_sign", "imo", "length_m", "destination")]))
+    return v.withColumn("faulty_speed", (F.col("sog_glitches") >= faulty_min_count)
+                        & (F.col("sog_glitches") >= faulty_min_share * F.col("n_msgs")))
 
 
 def build_installations(spark, cfg, path) -> DataFrame:
