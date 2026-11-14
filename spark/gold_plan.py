@@ -56,6 +56,17 @@ def days_between(first, last):
     return [first + timedelta(days=i) for i in range((last - first).days + 1)]
 
 
+def has_data(path):
+    """True if a table folder holds at least one data file (an empty Spark write leaves only _SUCCESS)."""
+    if not os.path.isdir(path):
+        return False
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if not d.startswith(("_", "."))]
+        if any(f.endswith(".parquet") for f in files):
+            return True
+    return False
+
+
 def is_partitioned(path):
     return os.path.isdir(path) and any(n.startswith("dt=") for n in os.listdir(path))
 
