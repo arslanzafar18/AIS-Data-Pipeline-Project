@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the fishing vessel register every Monday
+
+[Timer]
+OnCalendar=Mon *-*-* 05:30:00 UTC
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

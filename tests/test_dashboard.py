@@ -72,3 +72,41 @@ def test_visits_carry_waiting_and_alongside_minutes(spark, tmp_path):
     data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path), zones=zones))
     got = sorted(zip(data["v"]["m"], data["v"]["t"], data["v"]["w"], data["v"]["a"]), key=lambda r: (r[0], r[1]))
     assert got == [(1, 12, 45, 150), (1, 36, 5, 50), (2, 12, None, None)]
+
+
+def test_standby_gaps_skip_feed_outages_and_onshore(spark):
+    from datetime import timedelta
+    h = lambda n: T + timedelta(hours=n)
+    # PLATFORM has a vessel at hours 0, 1, 5 and 9; TERMINAL (onshore) has none after hour 0
+    hourly = spark.createDataFrame([("PLATFORM", h(n), 1, False) for n in (0, 1, 5, 9)] + [("TERMINAL", h(0), 1, True)], HOURLY)
+    # the feed is normal every hour except hour 3 (outage: 10 messages against a median of 1000)
+    coverage = spark.createDataFrame([(h(n), 10 if n == 3 else 1000, 50) for n in range(10)], "hour_ts timestamp, msgs long, vessels long")
+    gaps = {(r["start_ts"], r["hours"]) for r in dashboard.standby_gaps(hourly, coverage, 0.5, h(0), h(9)).collect()}
+    assert gaps == {(h(2), 1), (h(4), 1), (h(6), 3)}      # hour 3 is unknown, so 2..4 is two gaps, not one of three hours
+
+
+def test_dashboard_embeds_landings_gaps_and_outages(spark, tmp_path):
+    from datetime import timedelta
+    visits = spark.createDataFrame([(1, "PLATFORM", "JACKET 4 LEGS", False, T, 60.0, 1)], VISITS)
+    hourly = spark.createDataFrame([("PLATFORM", T, 1, False), ("PLATFORM", T + timedelta(hours=4), 1, False)], HOURLY)
+    coverage = spark.createDataFrame([(T + timedelta(hours=n), 5 if n == 2 else 1000, 50) for n in range(5)], "hour_ts timestamp, msgs long, vessels long")
+    landings = spark.createDataFrame([("PLATFORM", T + timedelta(hours=1), 12.0)], "inst_name string, arrival_ts timestamp, minutes_in_zone double")
+    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path),
+                                 landings=landings, coverage=coverage))
+    assert data["hl"] == {"i": [0], "t": [13], "d": [12]}
+    assert sorted(zip(data["gp"]["t"], data["gp"]["n"])) == [(13, 1), (15, 1)] and data["out"] == [14]
+
+
+def test_fishing_register_is_matched_on_call_sign(spark, tmp_path):
+    reg = tmp_path / "fishing_vessels.csv"
+    reg.write_text("call_sign,name,length_m\nLK-2345,KYSTFISK,18.2\n,NO SIGN,10\n", encoding="utf-8")
+    signs = dashboard.load_fishing_call_signs(str(reg))
+    assert signs == {"LK2345"} and dashboard.load_fishing_call_signs(str(tmp_path / "missing.csv")) is None
+    visits = spark.createDataFrame([(1, "PLATFORM", "JACKET 4 LEGS", False, T, 90.0, 1),
+                                    (2, "PLATFORM", "JACKET 4 LEGS", False, T, 30.0, 0)], VISITS)
+    hourly = spark.createDataFrame([("PLATFORM", T, 2, False)], HOURLY)
+    vessels = spark.createDataFrame([(1, "KYSTFISK", 99, 18, False, "lk 2345"), (2, "SUPPLY", 90, 80, False, "LAXX")],
+                                    "mmsi long, name string, ship_type int, length_m int, is_facility boolean, call_sign string")
+    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path / "out"),
+                                 vessels=vessels, fishing_call_signs=signs))
+    assert data["ves"]["1"][4] == 1 and data["ves"]["2"][4] == 0 and data["fishing_register"] is True

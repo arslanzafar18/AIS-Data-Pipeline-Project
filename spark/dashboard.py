@@ -58,7 +58,39 @@ def visit_zone_times(visits, zones):
                   .drop("_first"))
 
 
-def summarise(visits, hourly, zones=None, events=None, vessels=None):
+def standby_gaps(hourly, coverage, min_fraction, start, end):
+    """Runs of consecutive hours in which no vessel was within the near radius of an OFFSHORE installation, counting only
+    hours the feed covered (an hour with under min_fraction of the median message volume is unknown and splits a run).
+    One row per run: inst_name, start hour, hours."""
+    from spark.gold_logic import covered_hours
+    from pyspark.sql import Window
+    off = hourly.where(~F.coalesce(F.col("is_onshore").cast("boolean"), F.lit(False))) if "is_onshore" in hourly.columns else hourly
+    grid = (off.select("inst_name").distinct()
+               .withColumn("hour_ts", F.explode(F.sequence(F.lit(start), F.lit(end), F.expr("INTERVAL 1 HOUR")))))
+    ok = covered_hours(coverage, min_fraction, end).withColumnRenamed("_h", "hour_ts")
+    present = off.select("inst_name", F.date_trunc("hour", "hour_ts").alias("hour_ts")).distinct().withColumn("_p", F.lit(True))
+    empty = (grid.join(F.broadcast(ok), "hour_ts").join(present, ["inst_name", "hour_ts"], "left").where(F.col("_p").isNull())
+                 .withColumn("_i", (F.col("hour_ts").cast("long") / 3600).cast("long")))
+    run = F.col("_i") - F.row_number().over(Window.partitionBy("inst_name").orderBy("_i"))
+    return (empty.withColumn("_run", run).groupBy("inst_name", "_run")
+                 .agg(F.min("hour_ts").alias("start_ts"), F.count("*").alias("hours")).drop("_run"))
+
+
+def norm_call_sign(c):
+    return "".join(ch for ch in str(c or "").upper() if ch.isalnum())
+
+
+def load_fishing_call_signs(path):
+    """Radio call signs of registered Norwegian fishing vessels (bronze/reference/fishing_vessels.csv, column call_sign)."""
+    import csv
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, newline="", encoding="utf-8") as f:
+        return {norm_call_sign(r.get("call_sign")) for r in csv.DictReader(f)} - {""}
+
+
+def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=None, gaps=None, outage_hours=None,
+              fishing_call_signs=None):
     """Compact, column-wise data: one entry per visit, zone entry, event and hour, so the browser can recompute
     every number for any date range. Times are whole hours since t0 (midnight of the first day)."""
     end = hourly.agg(F.max("hour_ts")).collect()[0][0]
@@ -81,7 +113,9 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None):
         flags = sum((F.coalesce(_col(events, k).cast("int"), F.lit(0)) * bit) for k, bit in FLAG_BITS.items())
         er = events.select("event_type", "inst_name", "mmsi", "start_ts", "duration_min", "min_dist_m",
                            _col(events, "days_present_before").alias("days"), flags.alias("f")).collect()
-    for r in zr + er:
+    lr = landings.select("inst_name", "arrival_ts", "minutes_in_zone").collect() if landings is not None else []
+    gr = gaps.select("inst_name", "start_ts", "hours").collect() if gaps is not None else []
+    for r in zr + er + lr + gr:
         names.setdefault(r["inst_name"], (None, False))
     order = sorted(n for n in names if n is not None)
     idx = {n: k for k, n in enumerate(order)}
@@ -91,10 +125,12 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None):
     seen = {r["mmsi"] for r in vr} | {r["mmsi"] for r in zr} | {r["mmsi"] for r in er}
     ves = {}
     if vessels is not None:
+        fish = fishing_call_signs or set()
         for r in vessels.select("mmsi", _col(vessels, "name").alias("name"), _col(vessels, "ship_type").alias("st"),
+                                _col(vessels, "call_sign").alias("cs"),
                                 _col(vessels, "length_m").alias("len"), _col(vessels, "is_facility").alias("fac")).collect():
             if r["mmsi"] in seen:
-                ves[str(r["mmsi"])] = [r["name"], r["st"], r["len"], bool(r["fac"])]
+                ves[str(r["mmsi"])] = [r["name"], r["st"], r["len"], bool(r["fac"]), int(norm_call_sign(r["cs"]) in fish)]
     return {
         "t0": t0, "end": end, "buckets": [b[1] for b in BUCKETS],
         "inst": [[n, names[n][0], names[n][1], None, None, None] for n in order],
@@ -114,13 +150,30 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None):
                "d": [int(round(r["duration_min"] or 0)) for r in er],
                "x": [None if r["min_dist_m"] is None else int(r["min_dist_m"]) for r in er],
                "p": [r["days"] for r in er], "f": [int(r["f"] or 0) for r in er]},
+        "hl": {"i": [idx[r["inst_name"]] for r in lr], "t": [hrs(r["arrival_ts"]) for r in lr],
+               "d": [int(round(r["minutes_in_zone"] or 0)) for r in lr]},
+        "gp": {"i": [idx[r["inst_name"]] for r in gr], "t": [hrs(r["start_ts"]) for r in gr], "n": [int(r["hours"]) for r in gr]},
+        "out": sorted(hrs(h) for h in (outage_hours or []) if h >= t0),
         "ves": ves, "flag_bits": FLAG_BITS,
     }
 
 
 def build(visits, hourly, manifest, out_dir, fac=None, zones=None, events=None, vessels=None, installations=None,
-          rules=None):
-    data = summarise(visits, hourly, zones, events, vessels)
+          rules=None, landings=None, coverage=None, min_fraction=0.5, fishing_call_signs=None):
+    gaps, outage = None, None
+    if coverage is not None:
+        from spark.gold_logic import covered_hours
+        span = hourly.agg(F.min("hour_ts"), F.max("hour_ts")).collect()[0]
+        if span[0] is not None:
+            start = span[0].replace(hour=0, minute=0, second=0, microsecond=0)
+            gaps = standby_gaps(hourly, coverage, min_fraction, start, span[1])
+            ok = covered_hours(coverage, min_fraction, span[1]).select("_h")
+            hours = coverage.select("hour_ts")
+            outage = [r["hour_ts"] for r in hours.join(ok, hours["hour_ts"] == ok["_h"], "left_anti")
+                                                 .where(F.col("hour_ts") >= F.lit(start)).collect()]
+    data = summarise(visits, hourly, zones, events, vessels, landings, gaps, outage, fishing_call_signs)
+    if data is not None:
+        data["fishing_register"] = fishing_call_signs is not None
     if data is None:
         return None
     pos = {}
@@ -147,7 +200,8 @@ def rules_from_config(cfg):
     return {"min_days": rv.get("min_days", 3), "window_days": rv.get("window_days", 30),
             "large_ship_min_m": sc.get("large_ship_min_m", 100), "loiter_max_kn": sc.get("loiter_max_kn", 2.0),
             "loiter_min_minutes": sc.get("loiter_min_minutes", 120),
-            "ais_gap_min_minutes": sc.get("ais_gap_min_minutes", 30), "fast_kn": sc.get("zone_fast_kn", 10)}
+            "ais_gap_min_minutes": sc.get("ais_gap_min_minutes", 30), "fast_kn": sc.get("zone_fast_kn", 10),
+            "gap_alert_h": sc.get("standby_gap_alert_hours", 3)}
 
 
 def build_from_gold(spark, gold, manifest, out_dir, cfg, fac=None):
@@ -158,7 +212,9 @@ def build_from_gold(spark, gold, manifest, out_dir, cfg, fac=None):
     events = loiter if gaps is None else (gaps if loiter is None else loiter.unionByName(gaps, allowMissingColumns=True))
     return build(read("vessel_visits"), read("installation_activity_hourly"), manifest, out_dir, fac=fac,
                  zones=read("zone_entries"), events=events, vessels=read("vessels"),
-                 installations=read("installations"), rules=rules_from_config(cfg))
+                 installations=read("installations"), rules=rules_from_config(cfg), landings=read("helicopter_landings"),
+                 coverage=read("feed_coverage_hourly"), min_fraction=cfg.get("surveillance", {}).get("coverage_min_fraction", 0.5),
+                 fishing_call_signs=load_fishing_call_signs(os.path.join(gold, "..", "bronze", "reference", "fishing_vessels.csv")))
 
 
 def main():
@@ -321,9 +377,36 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
 </div>
 
 <div data-panel="safety" hidden>
-  <section><h2>Entries into 500 m safety zones</h2><p class="note" id="noteZ"></p><div class="map" id="mapZ"></div></section>
-  <section><h2>Installations with most zone entries</h2><p class="note" id="noteZtop"></p><div class="chart tall"><canvas id="cZone"></canvas></div></section>
+  <section><h2>Safety monitoring and emergency preparedness</h2>
+    <details class="help" open><summary>How to read and use this page</summary>
+      <dl class="defs">
+        <dt>Zone entry</dt><dd>A vessel inside an installation's 500 m safety zone; 30 minutes without a position inside starts a new entry. Only vessels with permission may enter.</dd>
+        <dt>Fast entry</dt><dd>A zone entry with a speed over <span class="rv" data-r="fast_kn"></span> kn recorded inside 500 m, not counting rescue boats. Speeds above 50 kn are GPS errors and already removed; a single fast reading can still be noise, repeated ones are worth checking.</dd>
+        <dt>Rescue boat</dt><dd>A fast rescue boat or daughter craft (name contains FRB, MOB, DC or DAUGHTER). They run at 25 to 30 kn in drills and crew transfers, so they are listed apart and not counted as fast entries.</dd>
+        <dt>Offshore fleet</dt><dd>Vessels that entered the 500 m zone of at least 2 different offshore installations, or at least 5 times in total, in the whole data period. Supply, standby, diving and crew vessels fall in this group whatever ship type their AIS reports (many supply vessels report "cargo").</dd>
+        <dt>Unexpected entry</dt><dd>An entry into an offshore installation's 500 m zone by a fishing vessel, or by a vessel outside the offshore fleet: a ship that almost never comes inside any safety zone.</dd>
+        <dt>Fishing vessel</dt><dd>Registered in the Norwegian fishing vessel register (Fiskeridirektoratet, matched on radio call sign), or reporting AIS ship type "fishing". Foreign fishing vessels are only found by their AIS type, and boats under 15 m often carry no AIS.</dd>
+        <dt>Vessel presence</dt><dd>The share of hours with at least one vessel within 5 km of an offshore installation. Hours when the whole feed was thin are left out. Offshore Norge guideline 064 sets rescue times (a person overboard picked up within 8 min; a ditched helicopter or evacuation to sea rescued within 120 min) but no fixed distance for standby vessels, and one vessel often covers several installations. So presence is context, not a test of those requirements.</dd>
+        <dt>Helideck landing</dt><dd>A search-and-rescue aircraft (MMSI 111xxxxxx, or an aircraft reporting altitude) inside the 500 m zone.</dd>
+      </dl>
+      <ol class="howto">
+        <li>Choose the days with the slider at the top.</li>
+        <li>Pick an installation on the map, by name below, or from the preparedness table; the lists then show that installation only. The pick is shared with the Traffic tab.</li>
+        <li>Start with the unexpected entries and fishing vessels, then the fast entries. The presence table shows how often each installation had a vessel nearby.</li>
+      </ol>
+    </details>
+    <div class="search"><input id="sq" list="ilist" placeholder="Pick an installation, e.g. HEIDRUN" aria-label="Installation"><button type="button" id="sclear" class="plain">All installations</button></div>
+    <p class="glance" id="sglance"></p></section>
+  <section><h2>Entries into 500 m safety zones</h2><p class="note">Click a circle to pick that installation.</p>
+    <ul class="legend" aria-label="Map legend"><li><span class="dot" style="background:var(--accent)"></span>Offshore installation</li>
+      <li><span class="dot" style="background:var(--onshore)"></span>Onshore terminal</li><li><span class="dot ring"></span>Fast entries recorded</li>
+      <li><span class="sizes"><span></span><span></span><span></span></span>Larger circle = more zone entries</li></ul>
+    <div class="map" id="mapZ"></div></section>
+  <section><h2>Unexpected zone entries</h2><p class="note">Fishing vessels and vessels outside the offshore fleet inside 500 m of an offshore installation, newest first.</p><div class="scroll" id="tUnexp"></div></section>
+  <section><h2>Fishing vessels near installations</h2><p class="note" id="nFish"></p><div class="scroll" id="tFish"></div></section>
   <section><h2>Fast zone entries</h2><p class="note" id="noteFast"></p><div class="scroll" id="tFast"></div></section>
+  <section><h2>Rescue boat activity</h2><p class="note">Fast rescue boats and daughter craft inside 500 m: drills, crew transfers and real call-outs. Listed so their high speeds are not mistaken for risky entries.</p><div class="scroll" id="tRescue"></div></section>
+  <section><h2 id="hPrep">Vessel presence and helideck landings</h2><p class="note" id="nPrep"></p><div class="scroll" id="tPrep"></div></section>
 </div>
 
 <div data-panel="surv" hidden>
@@ -361,7 +444,7 @@ const at = h => new Date(T0 + h * HOUR).toLocaleString('en-GB', {day:'numeric', 
 const dayName = k => new Date(T0 + k * DAY).toLocaleDateString('en-GB', {day:'numeric', month:'short', year:'numeric', timeZone:'UTC'});
 const I = D.inst, V = D.v, H = D.h, Z = D.zn || {i:[],m:[],t:[],d:[],kn:[],x:[]}, E = D.ev || {k:[],i:[],m:[],t:[],d:[],x:[],p:[],f:[]};
 const VES = D.ves || {}, B = D.flag_bits || {};
-const R = Object.assign({min_days:3, window_days:30, large_ship_min_m:100, loiter_max_kn:2, loiter_min_minutes:120, ais_gap_min_minutes:30, fast_kn:10}, D.rules || {});
+const R = Object.assign({min_days:3, window_days:30, large_ship_min_m:100, loiter_max_kn:2, loiter_min_minutes:120, ais_gap_min_minutes:30, fast_kn:10, gap_alert_h:3}, D.rules || {});
 const vname = m => (VES[m] && VES[m][0]) || ('MMSI ' + m);
 let tab = 'traffic', grp = 'all', survMode = 'look', from = Math.max(0, NDAYS - 7), to = NDAYS - 1, vessel = null;
 const charts = {}, maps = {};
@@ -410,7 +493,7 @@ const SHIP = c => c == null ? '–' : c === 30 ? 'fishing' : c >= 31 && c <= 32 
   : c >= 80 && c < 90 ? 'tanker' : c >= 90 && c < 100 ? 'other (often offshore supply)' : 'code ' + c;
 let sel = null;                                       // index into I of the picked installation, or null for all
 function pick(ii){ sel = ii; $('iq').value = ii == null ? '' : I[ii][0]; render();
-  const M = maps.mapT; if (ii != null && M && M.markers[I[ii][0]]) M.map.setView(M.markers[I[ii][0]].getLatLng(), 8); }
+  const M = maps[tab === 'safety' ? 'mapZ' : 'mapT']; if (ii != null && M && M.markers[I[ii][0]]) M.map.setView(M.markers[I[ii][0]].getLatLng(), 8); }
 function traffic(){
   if (sel != null && !keep(I[sel][2])) sel = null;
   const per = new Map(), calls = [], passing = [];
@@ -429,7 +512,6 @@ function traffic(){
   kpis('kpis', [[num(C.length), 'service calls'], [num(nVes), 'vessels serving'], [(C.length / days).toFixed(1), 'calls per day'],
     [dur(median(A)), 'median alongside'], [dur(median(W)), 'median wait'], [num(P.length), 'passing visits']]);
   // installation picker
-  const dl = $('ilist'); if (dl.childElementCount !== inst.length) { dl.replaceChildren(...inst.map(r => { const o = el('option'); o.value = r.name; return o; })); }
   $('iclear').hidden = sel == null; $('secTop').hidden = sel != null;
   // daily series and arrival hours
   const perDay = new Array(days).fill(0), arr = new Array(24).fill(0);
@@ -493,13 +575,27 @@ function traffic(){
 }
 $('iq').addEventListener('change', () => { const v = $('iq').value.trim().toUpperCase(); const ii = I.findIndex(r => r[0] === v); if (ii >= 0) pick(ii); });
 $('iclear').addEventListener('click', () => pick(null));
-{ const hd = document.querySelector('details.help');               // remember a collapsed help box (per browser)
-  try { if (localStorage.getItem('helpClosed') === '1') hd.open = false; } catch (e) {}
-  hd.addEventListener('toggle', () => { try { localStorage.setItem('helpClosed', hd.open ? '0' : '1'); } catch (e) {} }); }
+$('ilist').replaceChildren(...I.map(r => { const o = el('option'); o.value = r[0]; return o; }));
+document.querySelectorAll('details.help').forEach((hd, n) => {               // remember a collapsed help box (per browser)
+  try { if (localStorage.getItem('helpClosed' + n) === '1') hd.open = false; } catch (e) {}
+  hd.addEventListener('toggle', () => { try { localStorage.setItem('helpClosed' + n, hd.open ? '0' : '1'); } catch (e) {} }); });
 function focus(mapId, name){ const M = maps[mapId]; const m = M && M.markers[name]; if (!m) return;
   $(mapId).scrollIntoView({behavior:'smooth', block:'center'}); M.map.setView(m.getLatLng(), 9); m.openPopup(); }
 
-// ---------- Safety zones ----------
+// ---------- Safety zones and emergency preparedness ----------
+const HL = D.hl || {i:[], t:[], d:[]}, GP = D.gp || {i:[], t:[], n:[]}, OUT = new Set(D.out || []);
+const RESCUE = /\b(FRB|MOB|DC|DAUGHTER)\b/;
+const isRescue = m => RESCUE.test(((VES[m] && VES[m][0]) || '').toUpperCase());
+const fishReg = m => !!(VES[m] && VES[m][4]), fishAis = m => !!(VES[m] && VES[m][1] === 30), isFishing = m => fishReg(m) || fishAis(m);
+const FLEET = (() => {                       // zone entries per vessel at offshore installations over the whole data period
+  const n = new Map(), inst = new Map();
+  for (let k = 0; k < Z.t.length; k++) { if (I[Z.i[k]][2]) continue; const m = Z.m[k];
+    n.set(m, (n.get(m) || 0) + 1); if (!inst.has(m)) inst.set(m, new Set()); inst.get(m).add(Z.i[k]); }
+  return {n, inst, has: m => (inst.get(m) || new Set()).size >= 2 || (n.get(m) || 0) >= 5};
+})();
+const fishSource = m => fishReg(m) ? 'fishing register' : fishAis(m) ? 'AIS type fishing' : '';
+const unexpectedWhy = m => isFishing(m) ? 'fishing vessel (' + fishSource(m) + ')'
+  : 'rarely in safety zones: ' + (FLEET.n.get(m) || 0) + ' entries at ' + (FLEET.inst.get(m) || new Set()).size + ' installation(s) in all data';
 function zoneRows(filterMmsi){
   const rows = [];
   for (let k = 0; k < Z.t.length; k++) {
@@ -509,34 +605,79 @@ function zoneRows(filterMmsi){
   }
   return rows;
 }
+function earlierEntries(){                         // per vessel+installation: entry hours, to count earlier entries
+  const m = new Map(); for (let k = 0; k < Z.t.length; k++) { const key = Z.m[k] + '|' + Z.i[k]; if (!m.has(key)) m.set(key, []); m.get(key).push(Z.t[k]); } return m; }
+function preparedness(){
+  const a = from * 24, b = (to + 1) * 24, per = new Map();
+  let known = 0; for (let h = a; h < b && h < (END - T0) / HOUR + 1; h++) if (!OUT.has(h)) known++;
+  const get = ii => { let p = per.get(ii); if (!p) per.set(ii, p = {gapH:0, longest:0, longT:null, big:0, land:0, lastLand:-1}); return p; };
+  for (let k = 0; k < V.t.length; k++) if (!I[V.i[k]][2] && inRange(V.t[k])) get(V.i[k]);   // offshore installations with traffic
+  for (let k = 0; k < GP.t.length; k++) {
+    const s0 = Math.max(GP.t[k], a), e0 = Math.min(GP.t[k] + GP.n[k], b); if (e0 <= s0 || I[GP.i[k]][2]) continue;
+    const p = get(GP.i[k]), n = e0 - s0; p.gapH += n; if (n > p.longest) { p.longest = n; p.longT = s0; } if (n >= R.gap_alert_h) p.big++; }
+  for (let k = 0; k < HL.t.length; k++) { if (!inRange(HL.t[k]) || I[HL.i[k]][2]) continue; const p = get(HL.i[k]); p.land++; p.lastLand = Math.max(p.lastLand, HL.t[k]); }
+  return [...per].map(([ii, p]) => ({ii, name:I[ii][0], kind:I[ii][1], ...p, cover: known ? 100 * (1 - p.gapH / known) : null}))
+                 .sort((x, y) => y.longest - x.longest || y.gapH - x.gapH);
+}
 function safety(){
-  const rows = zoneRows(null), per = new Map(), fast = rows.filter(r => r.kn != null && r.kn > R.fast_kn);
-  for (const r of rows) { let p = per.get(r.ii); if (!p) { p = {n:0, fast:0, mins:0, ves:new Set()}; per.set(r.ii, p); }
-    p.n++; p.mins += r.d; p.ves.add(r.m); if (r.kn != null && r.kn > R.fast_kn) p.fast++; }
-  kpis('kpis', [[num(rows.length), 'zone entries'], [num(new Set(rows.map(r => r.m)).size), 'vessels'],
-    [dur(median(rows.map(r => r.d))), 'median time inside'], [num(fast.length), 'entries faster than ' + R.fast_kn + ' kn']]);
-  $('noteZ').textContent = 'Circle size shows entries into each 500 m zone; a ring marks installations with entries faster than ' + R.fast_kn + ' kn.';
-  $('noteZtop').textContent = 'Top 15 by entries, split by whether the top speed inside the zone exceeded ' + R.fast_kn + ' kn';
-  $('noteFast').textContent = 'Entries where a speed above ' + R.fast_kn + ' kn was recorded inside 500 m, fastest first. A single fast reading can be GPS noise; repeated ones are worth checking.';
-  const list = [...per].map(([ii, p]) => ({ii, name:I[ii][0], lat:I[ii][3], lon:I[ii][4], on:I[ii][2], ...p})).sort((a, b) => b.n - a.n);
+  if (sel != null && !keep(I[sel][2])) sel = null;
+  $('sq').value = sel == null ? '' : I[sel][0]; $('sclear').hidden = sel == null;
+  document.querySelectorAll('.rv').forEach(e => e.textContent = R[e.dataset.r]);
+  const all = zoneRows(null), rows = sel == null ? all : all.filter(r => r.ii === sel), per = new Map();
+  const isFast = r => r.kn != null && r.kn > R.fast_kn && !isRescue(r.m), fast = rows.filter(isFast), rescue = rows.filter(r => isRescue(r.m));
+  const prior = earlierEntries();
+  const unexp = rows.filter(r => !r.on && !isRescue(r.m) && (isFishing(r.m) || !FLEET.has(r.m)))
+                    .map(r => ({...r, before: prior.get(r.m + '|' + r.ii).filter(t => t < r.t).length}));
+  const fishVisits = [];
+  for (let k = 0; k < V.t.length; k++) { const ii = V.i[k];
+    if (!inRange(V.t[k]) || I[ii][2] || !isFishing(V.m[k]) || (sel != null && ii !== sel)) continue;
+    fishVisits.push({ii, inst:I[ii][0], m:V.m[k], t:V.t[k], d:V.d[k], z:V.z[k]}); }
+  for (const r of all) { let p = per.get(r.ii); if (!p) { p = {n:0, fast:0, ves:new Set()}; per.set(r.ii, p); } p.n++; p.ves.add(r.m); if (isFast(r)) p.fast++; }
+  const prep = preparedness().filter(r => sel == null || r.ii === sel);
+  const landings = prep.reduce((s, r) => s + r.land, 0);
+  kpis('kpis', [[num(rows.length), 'zone entries'], [num(unexp.length), 'unexpected entries'], [num(new Set(fishVisits.map(r => r.m)).size), 'fishing vessels within 5 km'],
+    [num(fast.length), 'faster than ' + R.fast_kn + ' kn'], [num(landings), 'helideck landings']]);
+  const g = $('sglance');
+  if (sel == null) g.textContent = '';
+  else { const p = prep[0];
+    g.textContent = I[sel][0] + ': ' + num(rows.length) + ' zone entries (' + num(fast.length) + ' fast, ' + num(unexp.length) + ' unexpected)' +
+      (p ? '; a vessel within 5 km in ' + (p.cover == null ? '–' : p.cover.toFixed(1) + '%') + ' of hours, longest time without ' + (p.longest ? p.longest + ' h' : 'none') +
+           '; ' + num(p.land) + (p.land === 1 ? ' helideck landing.' : ' helideck landings.') : '.'); }
+  const list = [...per].map(([ii, p]) => ({ii, name:I[ii][0], lat:I[ii][3], lon:I[ii][4], on:I[ii][2], ...p}));
   const M = getMap('mapZ');
   if (M) { const mx = Math.max(1, ...list.map(r => r.n)), pts = [];
     for (const r of list.filter(r => r.lat != null)) {
-      const c = css(r.on ? '--onshore' : '--accent');
-      const mk = L.circleMarker([r.lat, r.lon], {radius: 4 + 18 * Math.sqrt(r.n / mx), color: r.fast ? css('--warn') : c, weight: r.fast ? 2.5 : 1.5, fillColor: c, fillOpacity: 0.45})
-        .bindPopup(popup([r.name, num(r.n) + ' entries by ' + num(r.ves.size) + ' vessels', dur(r.mins) + ' inside in total', num(r.fast) + ' entries faster than ' + R.fast_kn + ' kn']))
-        .bindTooltip(r.name);
+      const c = css(r.on ? '--onshore' : '--accent'), me = r.ii === sel;
+      const mk = L.circleMarker([r.lat, r.lon], {radius: 4 + 18 * Math.sqrt(r.n / mx), color: r.fast || me ? css('--warn') : c, weight: me ? 4 : r.fast ? 2.5 : 1.5,
+          fillColor: c, fillOpacity: sel == null || me ? 0.45 : 0.15})
+        .bindTooltip(r.name + ': ' + num(r.n) + ' entries, ' + num(r.fast) + ' fast').on('click', () => pick(r.ii));
       M.layer.addLayer(mk); M.markers[r.name] = mk; pts.push([r.lat, r.lon]); }
     fit(M, pts); }
-  table('tFast', fast.sort((a, b) => b.kn - a.kn), [['Vessel', r => vlink(r.m)], ['Installation', r => r.inst], ['Entry (UTC)', r => at(r.t)],
-    ['Top speed', r => r.kn.toFixed(1) + ' kn', 1], ['Inside', r => dur(r.d), 1], ['Closest', r => num(r.x) + ' m', 1]], r => focus('mapZ', r.inst));
-  if (typeof Chart === 'undefined') return;
-  const top = list.slice(0, 15);
-  chart('cZone', {type:'bar', data:{labels: top.map(r => r.name), datasets:[
-      {label:'Faster than ' + R.fast_kn + ' kn inside', data: top.map(r => r.fast), backgroundColor: css('--warn')},
-      {label:'Other entries', data: top.map(r => r.n - r.fast), backgroundColor: css('--accent')}]},
-    options:{indexAxis:'y', maintainAspectRatio:false, animation:false, plugins:{legend:{position:'bottom'}}, scales:{x:{stacked:true}, y:{stacked:true, grid:{display:false}}}}});
+  $('nPrep').textContent = 'Offshore installations: share of hours with at least one vessel within 5 km (hours with a thin feed left out), the longest ' +
+    'time without one, and helideck landings. Context only: guideline 064 sets rescue times, not a standby distance, and one vessel can cover several ' +
+    'installations. Lowest presence first; click a row to pick the installation.';
+  table('tPrep', prep.sort((x, y) => (x.cover ?? 101) - (y.cover ?? 101)), [['Installation', r => r.name], ['Type', r => (r.kind || '').toLowerCase()],
+    ['Vessel within 5 km', r => r.cover == null ? '–' : r.cover.toFixed(1) + '% of hours', 1], ['Longest time without', r => r.longest ? r.longest + ' h' : 'none', 1],
+    ['It started (UTC)', r => r.longT == null ? '–' : at(r.longT)],
+    ['Helideck landings', r => num(r.land), 1], ['Last landing (UTC)', r => r.lastLand < 0 ? '–' : at(r.lastLand)]], r => pick(r.ii));
+  $('noteFast').textContent = 'Entries where a speed above ' + R.fast_kn + ' kn was recorded inside 500 m, fastest first. Speed, size and closeness together decide the risk.';
+  const ty = r => SHIP(VES[r.m] && VES[r.m][1]), len = r => VES[r.m] && VES[r.m][2] ? VES[r.m][2] + ' m' : '–';
+  table('tFast', fast.sort((a, b) => b.kn - a.kn || (a.x ?? 1e9) - (b.x ?? 1e9)), [['Vessel', r => vlink(r.m)], ['Type', ty], ['Length', len, 1],
+    ['Installation', r => r.inst], ['Entry (UTC)', r => at(r.t)], ['Top speed', r => r.kn.toFixed(1) + ' kn', 1], ['Closest', r => num(r.x) + ' m', 1],
+    ['Inside', r => dur(r.d), 1]], r => pick(r.ii));
+  table('tUnexp', unexp.sort((a, b) => b.t - a.t), [['Vessel', r => vlink(r.m)], ['Type', ty], ['Length', len, 1], ['Installation', r => r.inst],
+    ['Entry (UTC)', r => at(r.t)], ['Inside', r => dur(r.d), 1], ['Closest', r => num(r.x) + ' m', 1],
+    ['Top speed', r => r.kn == null ? '–' : r.kn.toFixed(1) + ' kn', 1], ['Earlier entries here', r => r.before ? num(r.before) : 'first time', 1],
+    ['Why unexpected', r => unexpectedWhy(r.m)]], r => pick(r.ii));
+  $('nFish').textContent = 'Visits by fishing vessels within 5 km of offshore installations, newest first. ' + (D.fishing_register
+    ? 'Norwegian vessels are identified from the fishing vessel register; others by AIS type.' : 'The fishing vessel register is not loaded yet, so only AIS type "fishing" is used.');
+  table('tFish', fishVisits.sort((a, b) => b.t - a.t), [['Vessel', r => vlink(r.m)], ['Identified by', r => fishSource(r.m)], ['Length', len, 1],
+    ['Installation', r => r.inst], ['Arrived (UTC)', r => at(r.t)], ['Stayed', r => dur(r.d), 1], ['Inside 500 m', r => r.z ? 'yes' : 'no']], r => pick(r.ii));
+  table('tRescue', rescue.sort((a, b) => b.t - a.t), [['Boat', r => vlink(r.m)], ['Installation', r => r.inst], ['Entry (UTC)', r => at(r.t)],
+    ['Top speed', r => r.kn == null ? '–' : r.kn.toFixed(1) + ' kn', 1], ['Inside', r => dur(r.d), 1], ['Closest', r => num(r.x) + ' m', 1]], r => pick(r.ii));
 }
+$('sq').addEventListener('change', () => { const v = $('sq').value.trim().toUpperCase(); const ii = I.findIndex(r => r[0] === v); if (ii >= 0) pick(ii); });
+$('sclear').addEventListener('click', () => pick(null));
 
 // ---------- Surveillance ----------
 function eventRows(filterMmsi){
