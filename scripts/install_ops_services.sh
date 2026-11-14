@@ -7,7 +7,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [ ! -f ~/jaeger/jaeger.env ]; then
-  pid=$(pgrep -f -o 'jaeger.*(--config|config=)' || true)
+  # the Jaeger program itself, not a tmux/bash/tee wrapper around it
+  pid=$(pgrep -f -n '^[^ ]*/jaeger[^ /]* .*(--config|config=)' || true)
   if [ -z "$pid" ]; then
     echo "Jaeger is not running, so its start command cannot be copied. Start it the usual way, then rerun." >&2
     exit 1
@@ -25,7 +26,8 @@ sudo systemctl daemon-reload
 
 # The hand-started copies hold the ports; stop them just before the services take over.
 pkill -f 'http.server 8050' || true
-pkill -f 'jaeger.*(--config|config=)' || true
+tmux kill-session -t jaeger 2>/dev/null || true
+pkill -f '^[^ ]*/jaeger[^ /]* .*(--config|config=)' || true
 sleep 2
 sudo systemctl enable --now ais-dashboard jaeger bronze-retention.timer
 sleep 3

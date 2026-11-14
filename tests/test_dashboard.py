@@ -54,3 +54,21 @@ def test_dashboard_embeds_zone_entries_events_and_vessels(spark, tmp_path):
     assert data["ev"]["f"][1] == bits["regular_visitor"] + bits["support_craft"] and data["ev"]["p"] == [0, 5]
     assert set(data["ves"]) == {"1", "2"} and data["ves"]["1"][0] == "ESVAGT AURORA"   # only vessels with activity
     assert data["rules"] == {"min_days": 3}
+
+
+def test_visits_carry_waiting_and_alongside_minutes(spark, tmp_path):
+    from datetime import timedelta
+    visits = spark.createDataFrame(
+        [(1, "PLATFORM", "JACKET 4 LEGS", False, T, 300.0, 1),            # waits 45 min, then two zone entries
+         (2, "PLATFORM", "JACKET 4 LEGS", False, T, 10.0, 0),             # passing: never inside 500 m
+         (1, "PLATFORM", "JACKET 4 LEGS", False, T + timedelta(days=1), 60.0, 1)],   # a later visit by the same ship
+        VISITS)
+    hourly = spark.createDataFrame([("PLATFORM", T, 2, False)], HOURLY)
+    zones = spark.createDataFrame(
+        [(1, "PLATFORM", T + timedelta(minutes=45), 120.0, 3.0, 80.0),
+         (1, "PLATFORM", T + timedelta(minutes=200), 30.0, 2.0, 90.0),
+         (1, "PLATFORM", T + timedelta(days=1, minutes=5), 50.0, 4.0, 60.0)],
+        "mmsi long, inst_name string, entry_ts timestamp, minutes_inside double, max_sog_kn double, min_dist_m double")
+    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path), zones=zones))
+    got = sorted(zip(data["v"]["m"], data["v"]["t"], data["v"]["w"], data["v"]["a"]), key=lambda r: (r[0], r[1]))
+    assert got == [(1, 12, 45, 150), (1, 36, 5, 50), (2, 12, None, None)]

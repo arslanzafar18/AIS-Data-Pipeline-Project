@@ -39,6 +39,25 @@ def _col(df, c):
     return F.col(c) if c in df.columns else F.lit(None)
 
 
+def visit_zone_times(visits, zones):
+    """Per visit: minutes from arrival within the near radius until the first 500 m zone entry (wait_min) and minutes
+    inside the zone in total (alongside_min). Zone entries are matched to the visit of the same vessel and installation
+    that contains them; visits that never entered the zone get nulls."""
+    if zones is None:
+        return visits.withColumn("wait_min", F.lit(None).cast("double")).withColumn("alongside_min", F.lit(None).cast("double"))
+    v = visits.alias("v")
+    z = zones.select("mmsi", "inst_name", "entry_ts", "minutes_inside").alias("z")
+    dep = (F.col("v.departure_ts") if "departure_ts" in visits.columns
+           else (F.col("v.arrival_ts").cast("long") + F.col("v.duration_min") * 60).cast("timestamp"))
+    hit = (v.join(z, (F.col("v.mmsi") == F.col("z.mmsi")) & (F.col("v.inst_name") == F.col("z.inst_name"))
+                  & F.col("z.entry_ts").between(F.col("v.arrival_ts"), dep))
+            .groupBy(F.col("v.mmsi").alias("mmsi"), F.col("v.inst_name").alias("inst_name"), F.col("v.arrival_ts").alias("arrival_ts"))
+            .agg(F.min("z.entry_ts").alias("_first"), F.sum("z.minutes_inside").alias("alongside_min")))
+    return (visits.join(hit, ["mmsi", "inst_name", "arrival_ts"], "left")
+                  .withColumn("wait_min", (F.col("_first").cast("long") - F.col("arrival_ts").cast("long")) / 60.0)
+                  .drop("_first"))
+
+
 def summarise(visits, hourly, zones=None, events=None, vessels=None):
     """Compact, column-wise data: one entry per visit, zone entry, event and hour, so the browser can recompute
     every number for any date range. Times are whole hours since t0 (midnight of the first day)."""
@@ -49,7 +68,8 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None):
     names = {r["inst_name"]: (r["inst_kind"], bool(r["onshore"])) for r in
              visits.groupBy("inst_name").agg(F.first("inst_kind", ignorenulls=True).alias("inst_kind"),
                                              F.max(on_v).alias("onshore")).collect()}
-    vr = visits.select("inst_name", "mmsi", "arrival_ts", "duration_min", "entered_zone").collect()
+    vr = (visit_zone_times(visits, zones)
+          .select("inst_name", "mmsi", "arrival_ts", "duration_min", "entered_zone", "wait_min", "alongside_min").collect())
     hr = (hourly.groupBy("hour_ts")
                 .agg(F.sum(F.when(on_h, 0).otherwise(F.col("distinct_vessels"))).alias("off"),
                      F.sum(F.when(on_h, F.col("distinct_vessels")).otherwise(0)).alias("on"))
@@ -80,7 +100,9 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None):
         "inst": [[n, names[n][0], names[n][1], None, None, None] for n in order],
         "v": {"i": [idx[r["inst_name"]] for r in vr], "m": [r["mmsi"] for r in vr],
               "t": [hrs(r["arrival_ts"]) for r in vr], "d": [int(round(r["duration_min"] or 0)) for r in vr],
-              "z": [int(r["entered_zone"] or 0) for r in vr]},
+              "z": [int(r["entered_zone"] or 0) for r in vr],
+              "w": [None if r["wait_min"] is None else int(round(r["wait_min"])) for r in vr],
+              "a": [None if r["alongside_min"] is None else int(round(r["alongside_min"])) for r in vr]},
         "h": {"t": [hrs(r["hour_ts"]) for r in hr], "off": [int(r["off"] or 0) for r in hr],
               "on": [int(r["on"] or 0) for r in hr]},
         "zn": {"i": [idx[r["inst_name"]] for r in zr], "m": [r["mmsi"] for r in zr], "t": [hrs(r["entry_ts"]) for r in zr],
@@ -217,6 +239,20 @@ a.v{color:var(--accent);text-decoration:none;cursor:pointer}a.v:hover{text-decor
 .tag.look{border-color:var(--warn);color:var(--warn);font-weight:500}
 .why{white-space:normal;min-width:300px;max-width:480px;font-size:.8125rem;color:var(--muted);line-height:1.4}
 .search{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button.plain{font:inherit;color:var(--accent);background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer}
+.help summary{cursor:pointer;font-weight:500;color:var(--accent);margin:4px 0}
+.defs{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;margin:10px 0;font-size:.875rem}
+.defs dt{font-weight:600}.defs dd{margin:0;color:var(--muted)}
+@media (max-width:600px){.defs{grid-template-columns:1fr}.defs dd{margin-bottom:6px}}
+.example{font-size:.875rem;margin:6px 0;padding:6px 10px;border-left:3px solid var(--signal);background:color-mix(in srgb,var(--signal) 8%,transparent)}
+.howto{font-size:.875rem;color:var(--muted);margin:6px 0 4px;padding-left:20px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;list-style:none;margin:0 0 10px;padding:0;font-size:.8125rem;color:var(--muted);align-items:center}
+.legend li{display:flex;align-items:center;gap:6px}
+.dot{width:12px;height:12px;border-radius:50%;display:inline-block;opacity:.75}
+.dot.ring{background:transparent;border:3px solid var(--warn);opacity:1}
+.sizes{display:inline-flex;align-items:center;gap:2px}.sizes span{display:inline-block;border-radius:50%;border:1.5px solid var(--muted)}
+.sizes span:nth-child(1){width:6px;height:6px}.sizes span:nth-child(2){width:10px;height:10px}.sizes span:nth-child(3){width:14px;height:14px}
+.glance{margin:12px 0 0;max-width:90ch}.glance:empty{display:none}
 .search input{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);min-width:320px}
 code{font-size:.8125rem;background:color-mix(in srgb,var(--line) 50%,transparent);padding:1px 5px;border-radius:4px}
 [hidden]{display:none!important}
@@ -250,13 +286,38 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
 </div>
 
 <div data-panel="traffic">
-  <section><h2>Where the traffic is</h2><p class="note">Circle size shows visits; teal is offshore, violet is onshore. Click a circle or a table row for details.</p><div class="map" id="mapT"></div></section>
-  <section><h2>Busiest installations</h2><p class="note">Top 15 by visits, split by whether the vessel entered the 500 m safety zone</p><div class="chart tall"><canvas id="cTop"></canvas></div></section>
+  <section><h2>Supply and service traffic at installations</h2>
+    <details class="help" open><summary>How to read and use this page</summary>
+      <dl class="defs">
+        <dt>Visit</dt><dd>A vessel within 5 km of an offshore installation (1.5 km for onshore terminals). 30 minutes without a position starts a new visit.</dd>
+        <dt>Service call</dt><dd>A visit that came inside the installation's 500 m safety zone. Only vessels with permission may enter the zone, so entering it is a good sign of supply, standby or crew work. It is inferred from positions: the data does not say what the work was.</dd>
+        <dt>Passing visit</dt><dd>A visit that stayed outside 500 m: usually a ship sailing past.</dd>
+        <dt>Waiting</dt><dd>Time within 5 km before entering the 500 m zone, for example waiting for permission, the crane or the weather. Long waits point to queues or delays.</dd>
+        <dt>Alongside</dt><dd>Time inside the 500 m zone, where the work happens. Long times point to heavy jobs or standby duty.</dd>
+      </dl>
+      <p class="example">Example of one service call: arrives within 5 km 08:00 → waits 40 min → enters the zone 08:40 → alongside 3 h → leaves 11:40.</p>
+      <ol class="howto">
+        <li>Choose the days with the slider at the top.</li>
+        <li>Pick an installation: click it on the map, type its name below, or click its bar or table row. Every number on this tab then shows that installation only.</li>
+        <li>Read its workload per day, when vessels arrive, and how long they wait and stay.</li>
+        <li>The table lists the vessels serving it and the other installations they serve. Click a vessel name for its full history.</li>
+      </ol>
+    </details>
+    <div class="search"><input id="iq" list="ilist" placeholder="Pick an installation, e.g. HEIDRUN" aria-label="Installation"><datalist id="ilist"></datalist>
+      <button type="button" id="iclear" class="plain">All installations</button></div>
+    <p class="glance" id="glance"></p></section>
+  <section><h2>Where service calls happen</h2><p class="note">Click a circle to pick that installation.</p>
+    <ul class="legend" aria-label="Map legend"><li><span class="dot" style="background:var(--accent)"></span>Offshore installation</li>
+      <li><span class="dot" style="background:var(--onshore)"></span>Onshore terminal</li>
+      <li><span class="dot ring"></span>Picked installation</li><li><span class="sizes"><span></span><span></span><span></span></span>Larger circle = more service calls</li></ul>
+    <div class="map" id="mapT"></div></section>
+  <section id="secTop"><h2>Busiest installations</h2><p class="note">Top 15 by service calls in the selected days. Click a bar to pick that installation.</p><div class="chart tall"><canvas id="cTop"></canvas></div></section>
+  <section><h2 id="hDaily">Service calls per day</h2><p class="note" id="nDaily"></p><div class="chart"><canvas id="cDaily"></canvas></div></section>
   <div class="grid">
-    <section><h2>Vessels near installations, per hour</h2><p class="note">Each vessel counted once per installation it is near (UTC)</p><div class="chart"><canvas id="cHourly"></canvas></div></section>
-    <section><h2>How long visits last</h2><p class="note">Visits that started in the selected days</p><div class="chart"><canvas id="cDur"></canvas></div></section>
+    <section><h2>When vessels arrive</h2><p class="note">Service calls by hour of arrival within 5 km, Norwegian time</p><div class="chart"><canvas id="cArr"></canvas></div></section>
+    <section><h2>Waiting and time alongside</h2><p class="note">Per service call: minutes within 5 km before entering the zone, and minutes inside it</p><div class="chart"><canvas id="cDur"></canvas></div></section>
   </div>
-  <section><h2>All installations with traffic</h2><div class="scroll" id="tTraffic"></div></section>
+  <section><h2 id="hTable"></h2><p class="note" id="nTable"></p><div class="scroll" id="tTraffic"></div></section>
 </div>
 
 <div data-panel="safety" hidden>
@@ -284,7 +345,7 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
     <section><h2>Visits to installations</h2><div class="scroll" id="vVi"></div></section>
   </div>
 </div>
-<footer>A visit is a vessel within 5 km of an installation (1.5 km for onshore facilities); a gap of more than 30 minutes starts a new visit. Rebuilt from the Gold tables after each successful hourly publish; this page reloads every 5 minutes while you are not using it.</footer>
+<footer>Rebuilt from the Gold tables after each successful hourly publish; this page reloads every 5 minutes while you are not using it.</footer>
 </main>
 <script type="application/json" id="data">__DATA__</script>
 <script>
@@ -299,7 +360,7 @@ const when = s => new Date(s).toLocaleString('en-GB', {weekday:'short', day:'num
 const at = h => new Date(T0 + h * HOUR).toLocaleString('en-GB', {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit', timeZone:'UTC'});
 const dayName = k => new Date(T0 + k * DAY).toLocaleDateString('en-GB', {day:'numeric', month:'short', year:'numeric', timeZone:'UTC'});
 const I = D.inst, V = D.v, H = D.h, Z = D.zn || {i:[],m:[],t:[],d:[],kn:[],x:[]}, E = D.ev || {k:[],i:[],m:[],t:[],d:[],x:[],p:[],f:[]};
-const VES = D.ves || {}, B = D.flag_bits || {}, LIM = [15, 60, 180, 720, 1440];
+const VES = D.ves || {}, B = D.flag_bits || {};
 const R = Object.assign({min_days:3, window_days:30, large_ship_min_m:100, loiter_max_kn:2, loiter_min_minutes:120, ais_gap_min_minutes:30, fast_kn:10}, D.rules || {});
 const vname = m => (VES[m] && VES[m][0]) || ('MMSI ' + m);
 let tab = 'traffic', grp = 'all', survMode = 'look', from = Math.max(0, NDAYS - 7), to = NDAYS - 1, vessel = null;
@@ -340,47 +401,101 @@ function getMap(id){
 function fit(M, pts){ if (pts.length && !M.fitted) { M.map.fitBounds(pts, {padding: [24, 24]}); M.fitted = true; } }
 function popup(lines){ const d = el('div'); d.append(el('b', lines[0])); for (const l of lines.slice(1)) d.append(el('div', l)); return d; }
 
-// ---------- Traffic ----------
+// ---------- Traffic (logistics planner) ----------
+const BIN = [15, 30, 60, 120, 240, 480, 1440], BIN_L = ['Under 15 min', '15–30 min', '30–60 min', '1–2 h', '2–4 h', '4–8 h', '8–24 h', 'Over 24 h'];
+const bin = m => { const j = BIN.findIndex(x => m < x); return j < 0 ? BIN.length : j; };
+const osloHour = t => +new Date(T0 + t * HOUR).toLocaleString('en-GB', {hour:'2-digit', hourCycle:'h23', timeZone:'Europe/Oslo'});
+const SHIP = c => c == null ? '–' : c === 30 ? 'fishing' : c >= 31 && c <= 32 ? 'towing' : c === 50 ? 'pilot' : c === 51 ? 'search and rescue'
+  : c === 52 ? 'tug' : c === 53 ? 'port tender' : c === 55 ? 'law enforcement' : c >= 60 && c < 70 ? 'passenger' : c >= 70 && c < 80 ? 'cargo'
+  : c >= 80 && c < 90 ? 'tanker' : c >= 90 && c < 100 ? 'other (often offshore supply)' : 'code ' + c;
+let sel = null;                                       // index into I of the picked installation, or null for all
+function pick(ii){ sel = ii; $('iq').value = ii == null ? '' : I[ii][0]; render();
+  const M = maps.mapT; if (ii != null && M && M.markers[I[ii][0]]) M.map.setView(M.markers[I[ii][0]].getLatLng(), 8); }
 function traffic(){
-  const a = from * 24, b = (to + 1) * 24, per = new Map(), ships = new Set(), ds = [], buckets = D.buckets.map(() => 0);
+  if (sel != null && !keep(I[sel][2])) sel = null;
+  const per = new Map(), calls = [], passing = [];
   for (let k = 0; k < V.t.length; k++) {
     if (!inRange(V.t[k])) continue; const ii = V.i[k]; if (!keep(I[ii][2])) continue;
-    const d = V.d[k], m = V.m[k]; ships.add(m); ds.push(d);
-    let j = LIM.findIndex(x => d < x); buckets[j < 0 ? LIM.length : j]++;
-    let p = per.get(ii); if (!p) { p = {visits:0, ves:new Set(), ds:[], zone:0}; per.set(ii, p); }
-    p.visits++; p.ves.add(m); p.ds.push(d); p.zone += V.z[k];
+    let p = per.get(ii); if (!p) { p = {calls:0, pass:0, ves:new Set(), a:[], w:[]}; per.set(ii, p); }
+    const r = {ii, m:V.m[k], t:V.t[k], d:V.d[k], w:V.w ? V.w[k] : null, a:V.a ? V.a[k] : null};
+    if (V.z[k]) { p.calls++; p.ves.add(r.m); if (r.a != null) p.a.push(r.a); if (r.w != null) p.w.push(r.w); calls.push(r); }
+    else { p.pass++; passing.push(r); }
   }
   const inst = [...per].map(([ii, p]) => ({ii, name:I[ii][0], kind:I[ii][1], on:I[ii][2], lat:I[ii][3], lon:I[ii][4], field:I[ii][5],
-    visits:p.visits, vessels:p.ves.size, median:median(p.ds), zone:p.zone})).sort((x, y) => y.visits - x.visits);
-  kpis('kpis', [[num(ds.length), 'visits'], [num(ships.size), 'vessels'], [num(per.size), 'installations with traffic'], [dur(median(ds)), 'median visit']]);
+    calls:p.calls, pass:p.pass, vessels:p.ves.size, along:median(p.a), wait:median(p.w)})).sort((x, y) => y.calls - x.calls || y.pass - x.pass);
+  const C = sel == null ? calls : calls.filter(r => r.ii === sel), P = sel == null ? passing : passing.filter(r => r.ii === sel);
+  const days = to - from + 1, nVes = new Set(C.map(r => r.m)).size;
+  const A = C.map(r => r.a).filter(x => x != null), W = C.map(r => r.w).filter(x => x != null);
+  kpis('kpis', [[num(C.length), 'service calls'], [num(nVes), 'vessels serving'], [(C.length / days).toFixed(1), 'calls per day'],
+    [dur(median(A)), 'median alongside'], [dur(median(W)), 'median wait'], [num(P.length), 'passing visits']]);
+  // installation picker
+  const dl = $('ilist'); if (dl.childElementCount !== inst.length) { dl.replaceChildren(...inst.map(r => { const o = el('option'); o.value = r.name; return o; })); }
+  $('iclear').hidden = sel == null; $('secTop').hidden = sel != null;
+  // daily series and arrival hours
+  const perDay = new Array(days).fill(0), arr = new Array(24).fill(0);
+  for (const r of C) { perDay[Math.floor(r.t / 24) - from]++; arr[osloHour(r.t)]++; }
+  const g = $('glance');
+  if (sel == null) g.textContent = '';
+  else { const me = inst.find(r => r.ii === sel) || {calls:0, vessels:0}, best = perDay.indexOf(Math.max(...perDay)), peak = arr.indexOf(Math.max(...arr));
+    g.textContent = I[sel][0] + ((I[sel][1] || '') ? ' (' + I[sel][1].toLowerCase() + (I[sel][5] && I[sel][5] !== I[sel][0] ? ', field ' + I[sel][5] : '') + ')' : '') + ': ' +
+      (C.length ? num(C.length) + ' service calls by ' + num(nVes) + ' vessels in ' + days + (days === 1 ? ' day' : ' days') +
+        '; busiest day ' + dayName(from + best) + ' (' + perDay[best] + '); most arrivals ' + String(peak).padStart(2, '0') + ':00–' + String((peak + 1) % 24).padStart(2, '0') + ':00 Norwegian time.'
+       : 'no service calls in these days' + (P.length ? ', only ' + num(P.length) + ' passing visits.' : '.')); }
+  // map
   const M = getMap('mapT');
-  if (M) { const maxV = Math.max(1, ...inst.map(r => r.visits)), pts = [];
+  if (M) { const maxC = Math.max(1, ...inst.map(r => r.calls)), pts = [];
     for (const r of inst.filter(r => r.lat != null)) {
-      const c = css(r.on ? '--onshore' : '--accent');
-      const mk = L.circleMarker([r.lat, r.lon], {radius: 4 + 20 * Math.sqrt(r.visits / maxV), color: c, weight: 1.5, fillColor: c, fillOpacity: 0.45})
-        .bindPopup(popup([r.name, (r.kind || '').toLowerCase() + (r.field ? ' · ' + r.field : ''), num(r.visits) + ' visits by ' + num(r.vessels) + ' vessels',
-                          'Median stay ' + dur(r.median), num(r.zone) + ' visits entered the 500 m zone'])).bindTooltip(r.name);
+      const c = css(r.on ? '--onshore' : '--accent'), me = r.ii === sel;
+      const mk = L.circleMarker([r.lat, r.lon], {radius: 3 + 20 * Math.sqrt(r.calls / maxC), color: me ? css('--warn') : c, weight: me ? 3 : 1.5,
+          fillColor: c, fillOpacity: sel == null || me ? 0.45 : 0.15})
+        .bindTooltip(r.name + ': ' + num(r.calls) + ' service calls, ' + num(r.pass) + ' passing').on('click', () => pick(r.ii));
       M.layer.addLayer(mk); M.markers[r.name] = mk; pts.push([r.lat, r.lon]); }
     fit(M, pts); }
-  table('tTraffic', inst, [['Installation', r => r.name], ['Type', r => (r.kind || '').toLowerCase() + (r.on ? ' (onshore)' : '')],
-    ['Field', r => r.field || '–'], ['Visits', r => num(r.visits), 1], ['Vessels', r => num(r.vessels), 1], ['Median stay', r => dur(r.median), 1],
-    ['Entered 500 m zone', r => num(r.zone), 1]], r => focus('mapT', r.name));
+  // table: installations, or the vessels serving the picked one
+  if (sel == null) {
+    $('hTable').textContent = 'Installations'; $('nTable').textContent = 'Click a row to pick an installation.';
+    table('tTraffic', inst, [['Installation', r => r.name], ['Type', r => (r.kind || '').toLowerCase() + (r.on ? ' (onshore)' : '')],
+      ['Field', r => r.field || '–'], ['Service calls', r => num(r.calls), 1], ['Vessels serving', r => num(r.vessels), 1],
+      ['Median alongside', r => dur(r.along), 1], ['Median wait', r => dur(r.wait), 1], ['Passing visits', r => num(r.pass), 1]], r => pick(r.ii));
+  } else {
+    const byV = new Map(), elsewhere = new Map();
+    for (let k = 0; k < V.t.length; k++) {               // every installation, whatever the Offshore/Onshore switch shows
+      if (!V.z[k] || V.i[k] === sel || !inRange(V.t[k])) continue;
+      let s = elsewhere.get(V.m[k]); if (!s) elsewhere.set(V.m[k], s = new Map()); s.set(V.i[k], (s.get(V.i[k]) || 0) + 1); }
+    for (const r of C) { let v = byV.get(r.m); if (!v) byV.set(r.m, v = {m:r.m, n:0, a:0, w:[], last:-1}); v.n++; v.a += r.a || 0; if (r.w != null) v.w.push(r.w); v.last = Math.max(v.last, r.t); }
+    const rows = [...byV.values()].sort((x, y) => y.n - x.n || y.a - x.a);
+    const others = m => { const s = elsewhere.get(m); if (!s) return '–';
+      const top = [...s].sort((x, y) => y[1] - x[1]); return top.slice(0, 3).map(([ii, n]) => I[ii][0] + ' (' + n + ')').join(', ') + (top.length > 3 ? ' +' + (top.length - 3) : ''); };
+    $('hTable').textContent = 'Vessels serving ' + I[sel][0];
+    $('nTable').textContent = 'Service calls in the selected days. "Also serves" lists other installations the vessel made service calls to, which shows shared supply routes.';
+    table('tTraffic', rows, [['Vessel', r => vlink(r.m)], ['Type', r => SHIP(VES[r.m] && VES[r.m][1])], ['Length', r => VES[r.m] && VES[r.m][2] ? VES[r.m][2] + ' m' : '–', 1],
+      ['Calls', r => num(r.n), 1], ['Alongside', r => dur(r.a), 1], ['Median wait', r => dur(median(r.w)), 1], ['Last call (UTC)', r => at(r.last)],
+      ['Also serves', r => others(r.m)]]);
+  }
+  $('hDaily').textContent = sel == null ? 'Service calls per day, all installations' : 'Service calls per day at ' + I[sel][0];
+  $('nDaily').textContent = 'Days in UTC. ' + (sel == null ? 'Pick an installation to see its own workload.' : 'Compare with the vessels table below to see who did the work.');
   if (typeof Chart === 'undefined') return;
-  const top = inst.slice(0, 15);
-  chart('cTop', {type:'bar', data:{labels: top.map(r => r.name), datasets:[
-      {label:'Entered 500 m zone', data: top.map(r => r.zone), backgroundColor: css('--signal')},
-      {label:'Stayed outside 500 m', data: top.map(r => r.visits - r.zone), backgroundColor: css('--accent')}]},
-    options:{indexAxis:'y', maintainAspectRatio:false, animation:false, plugins:{legend:{position:'bottom'}}, scales:{x:{stacked:true}, y:{stacked:true, grid:{display:false}}}}});
-  const hx = [], hy = [];
-  for (let k = 0; k < H.t.length; k++) { if (!inRange(H.t[k])) continue; hx.push(H.t[k]);
-    hy.push(grp === 'offshore' ? H.off[k] : grp === 'onshore' ? H.on[k] : H.off[k] + H.on[k]); }
-  const long = to - from >= 3;
-  chart('cHourly', {type:'line', data:{labels: hx.map(t => new Date(T0 + t * HOUR).toLocaleString('en-GB', long ? {day:'numeric', month:'short', timeZone:'UTC'} : {weekday:'short', hour:'2-digit', timeZone:'UTC'})),
-      datasets:[{data: hy, borderColor: css('--accent'), pointRadius:0, borderWidth: long ? 1 : 2, tension:0.2}]},
-    options:{maintainAspectRatio:false, animation:false, plugins:{legend:{display:false}}, scales:{x:{ticks:{maxTicksLimit:8}, grid:{display:false}}, y:{beginAtZero:true}}}});
-  chart('cDur', {type:'bar', data:{labels: D.buckets, datasets:[{data: buckets, backgroundColor: css('--accent')}]},
-    options:{maintainAspectRatio:false, animation:false, plugins:{legend:{display:false}}, scales:{x:{grid:{display:false}}, y:{beginAtZero:true}}}});
+  const top = inst.filter(r => r.calls).slice(0, 15);
+  if (sel == null) chart('cTop', {type:'bar', data:{labels: top.map(r => r.name), datasets:[
+      {label:'Service calls', data: top.map(r => r.calls), backgroundColor: top.map(r => css(r.on ? '--onshore' : '--accent'))}]},
+    options:{indexAxis:'y', maintainAspectRatio:false, animation:false, plugins:{legend:{display:false}},
+      onClick: (e, els) => { if (els.length) pick(top[els[0].index].ii); }, scales:{y:{grid:{display:false}}}}});
+  chart('cDaily', {type:'bar', data:{labels: perDay.map((_, k) => new Date(T0 + (from + k) * DAY).toLocaleDateString('en-GB', {day:'numeric', month:'short', timeZone:'UTC'})),
+      datasets:[{label:'Service calls', data: perDay, backgroundColor: css('--accent')}]},
+    options:{maintainAspectRatio:false, animation:false, plugins:{legend:{display:false}}, scales:{x:{ticks:{maxTicksLimit:14}, grid:{display:false}}, y:{beginAtZero:true, ticks:{precision:0}}}}});
+  chart('cArr', {type:'bar', data:{labels: arr.map((_, h) => String(h).padStart(2, '0')), datasets:[{label:'Arrivals', data: arr, backgroundColor: css('--accent')}]},
+    options:{maintainAspectRatio:false, animation:false, plugins:{legend:{display:false}}, scales:{x:{grid:{display:false}}, y:{beginAtZero:true, ticks:{precision:0}}}}});
+  const bw = new Array(BIN_L.length).fill(0), ba = new Array(BIN_L.length).fill(0);
+  for (const w of W) bw[bin(w)]++; for (const x of A) ba[bin(x)]++;
+  chart('cDur', {type:'bar', data:{labels: BIN_L, datasets:[{label:'Waiting before entering', data: bw, backgroundColor: css('--signal')},
+      {label:'Alongside (inside 500 m)', data: ba, backgroundColor: css('--accent')}]},
+    options:{maintainAspectRatio:false, animation:false, plugins:{legend:{position:'bottom'}}, scales:{x:{grid:{display:false}}, y:{beginAtZero:true, ticks:{precision:0}}}}});
 }
+$('iq').addEventListener('change', () => { const v = $('iq').value.trim().toUpperCase(); const ii = I.findIndex(r => r[0] === v); if (ii >= 0) pick(ii); });
+$('iclear').addEventListener('click', () => pick(null));
+{ const hd = document.querySelector('details.help');               // remember a collapsed help box (per browser)
+  try { if (localStorage.getItem('helpClosed') === '1') hd.open = false; } catch (e) {}
+  hd.addEventListener('toggle', () => { try { localStorage.setItem('helpClosed', hd.open ? '0' : '1'); } catch (e) {} }); }
 function focus(mapId, name){ const M = maps[mapId]; const m = M && M.markers[name]; if (!m) return;
   $(mapId).scrollIntoView({behavior:'smooth', block:'center'}); M.map.setView(m.getLatLng(), 9); m.openPopup(); }
 
