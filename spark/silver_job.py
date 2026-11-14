@@ -33,7 +33,7 @@ def main(src="bronze/raw", ckpt="_checkpoints/silver", max_files=None):
 
     def _process(df, batch_id):
         t0 = time.time()
-        flagged = L.validate(L.standardize(L.parse(df))).cache()
+        flagged = L.validate(L.standardize(L.parse(df), cfg.get("max_ship_kn", 50.0))).cache()
         with obs.span("silver.quality_agg"):
             q = L.quality_agg(flagged)                               # BEFORE-processing quality (one action)
         with obs.span("silver.lineage"):

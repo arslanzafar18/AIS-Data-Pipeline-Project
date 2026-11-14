@@ -18,10 +18,12 @@ PAYLOAD_SCHEMA = T.StructType([
     T.StructField("navigationalStatus", T.IntegerType()), T.StructField("destination", T.StringType()),
     T.StructField("callSign", T.StringType()), T.StructField("imoNumber", T.LongType()),
     T.StructField("shipLength", T.IntegerType()), T.StructField("shipWidth", T.IntegerType()),
+    T.StructField("altitude", T.IntegerType()),           # only search-and-rescue aircraft report it
 ])
+AIRCRAFT_MMSI = (111000000, 111999999)                    # ITU: MMSIs 111MIDxxx are search-and-rescue aircraft
 BRONZE_SCHEMA = T.StructType([T.StructField(n, T.StringType()) for n in
                               ["_source", "_ingest_ts", "_run_id", "_file", "payload"]])
-KNOWN_UNUSED_FIELDS = ["altitude", "dimensionA", "dimensionB", "dimensionC", "dimensionD", "draught", "eta",
+KNOWN_UNUSED_FIELDS = ["dimensionA", "dimensionB", "dimensionC", "dimensionD", "draught", "eta",
                        "msgtimeStatic", "positionFixingDeviceType", "reportClass", "stream"]
 REJECT_REASONS = ["parse_failed", "bad_mmsi", "bad_timestamp", "missing_position",
                   "sentinel_position", "out_of_range", "future_timestamp"]
@@ -41,17 +43,23 @@ def parse(bronze: DataFrame) -> DataFrame:
                          failed.alias("parse_failed"), *cols)
 
 
-def standardize(p: DataFrame) -> DataFrame:
-    """Consistent types, UTC timestamps, units (knots, degrees), sentinel values -> null (counted as corrections)."""
+def standardize(p: DataFrame, max_ship_kn: float = 50.0) -> DataFrame:
+    """Consistent types, UTC timestamps, units (knots, degrees), sentinel values -> null (counted as corrections).
+    is_aircraft: SAR-aircraft MMSI range or an altitude reported. A ship speed above max_ship_kn (but below the
+    102.3 sentinel) is physically impossible for these vessels: nulled and flagged sog_glitch (counted)."""
     sog_bad = F.col("speedOverGround").isNotNull() & ((F.col("speedOverGround") >= 102.3) | (F.col("speedOverGround") < 0))
+    aircraft = F.col("mmsi").between(*AIRCRAFT_MMSI) | F.col("altitude").isNotNull()
+    glitch = F.col("speedOverGround").isNotNull() & ~sog_bad & (F.col("speedOverGround") > max_ship_kn) & ~F.coalesce(aircraft, F.lit(False))
     return (p.withColumn("event_ts", F.to_timestamp("msgtime"))
              .withColumn("ingest_ts", F.to_timestamp("_ingest_ts"))
              .withColumn("latency_s", F.col("ingest_ts").cast("long") - F.col("event_ts").cast("long"))
              .withColumn("fix_sog", sog_bad)
+             .withColumn("is_aircraft", F.coalesce(aircraft, F.lit(False)))
+             .withColumn("fix_sog_glitch", glitch).withColumn("sog_glitch", glitch)
              .withColumn("fix_heading", F.col("trueHeading") == 511)
              .withColumn("fix_rot", F.col("rateOfTurn") <= -128)
              .withColumn("fix_shiptype", F.col("shipType") == 0)
-             .withColumn("speedOverGround", F.when(F.col("fix_sog"), None).otherwise(F.col("speedOverGround")))
+             .withColumn("speedOverGround", F.when(F.col("fix_sog") | F.col("fix_sog_glitch"), None).otherwise(F.col("speedOverGround")))
              .withColumn("trueHeading", F.when(F.col("fix_heading"), None).otherwise(F.col("trueHeading")))
              .withColumn("rateOfTurn", F.when(F.col("fix_rot"), None).otherwise(F.col("rateOfTurn")))
              .withColumn("shipType", F.when(F.col("fix_shiptype"), None).otherwise(F.col("shipType")))
@@ -105,7 +113,8 @@ def enrich(v: DataFrame, fac: DataFrame, near_m: float, at_m: float, stationary_
 SILVER_COLUMNS = ["mmsi", "event_ts", "ingest_ts", "latency_s", "latitude", "longitude", "speedOverGround",
                   "courseOverGround", "trueHeading", "rateOfTurn", "name", "shipType", "navigationalStatus",
                   "destination", "callSign", "imo", "shipLength", "shipWidth", "inst_name", "inst_kind", "is_onshore", "dist_m",
-                  "is_near_installation", "is_at_installation", "is_stationary", "_run_id", "_file", "dt", "hour"]
+                  "is_near_installation", "is_at_installation", "is_stationary", "altitude", "is_aircraft", "sog_glitch",
+                  "_run_id", "_file", "dt", "hour"]
 
 
 def quality_agg(flagged: DataFrame) -> dict:
@@ -116,6 +125,8 @@ def quality_agg(flagged: DataFrame) -> dict:
              S(F.col("reject_reason").isNull()).alias("valid_rows"),
              S(F.col("reject_reason").isNotNull()).alias("rejected_rows"),
              S(F.col("fix_sog") & F.col("reject_reason").isNull()).alias("corrected_sog"),
+             S(F.col("fix_sog_glitch") & F.col("reject_reason").isNull()).alias("corrected_sog_glitch"),
+             S(F.col("is_aircraft") & F.col("reject_reason").isNull()).alias("aircraft_rows"),
              S(F.col("fix_heading") & F.col("reject_reason").isNull()).alias("corrected_heading"),
              S(F.col("fix_rot") & F.col("reject_reason").isNull()).alias("corrected_rot"),
              S(F.col("fix_shiptype") & F.col("reject_reason").isNull()).alias("corrected_shiptype"),

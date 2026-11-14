@@ -53,13 +53,17 @@
     "coverage_min_fraction": 0.5,
     "large_ship_min_m": 100,
     "live_since": "2026-10-24 10:00:00",
-    "facility_stationary_kn": 1.0
+    "facility_stationary_kn": 1.0,
+    "faulty_speed_min_count": 10,
+    "faulty_speed_min_share": 0.01
   },
   "gold_shuffle_partitions": 32,
   "driver_memory": "6g",
   "gate": {
     "min_silver_rows": 1000,
     "max_reject_rate": 0.1,
-    "max_silver_staleness_min": 30
-  }
+    "max_silver_staleness_min": 30,
+    "max_sog_glitch_rate": 0.001
+  },
+  "max_ship_kn": 50
 }
