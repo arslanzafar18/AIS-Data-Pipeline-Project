@@ -54,6 +54,25 @@ def track_km(points):
     return km
 
 
+def place_visits(items, tracks, start_col, end_col, pad=timedelta(minutes=10)):
+    """Where the SHIP was during each visit or zone entry: the track point closest to the installation between
+    start and end (padded by one slot). Adds ship_lat / ship_lon (None when no track point falls in the window)."""
+    for it in items:
+        a, b = it.get(start_col), it.get(end_col)
+        best = None
+        if a is not None and b is not None:
+            for p in tracks:
+                if p.get("lat") is None or not (a - pad <= p["slot_ts"] <= b + pad):
+                    continue
+                if p.get("inst_name") not in (None, it.get("inst_name")):
+                    continue
+                key = p.get("dist_m") if p.get("dist_m") is not None else 1e12
+                if best is None or key < best[0]:
+                    best = (key, p)
+        it["ship_lat"], it["ship_lon"] = (best[1]["lat"], best[1]["lon"]) if best else (None, None)
+    return items
+
+
 def find_mmsi(vessels, mmsi=None, name=None):
     """Exactly one vessel by MMSI, or by name (case-insensitive, exact match first, then 'contains')."""
     if mmsi:
@@ -67,7 +86,7 @@ def find_mmsi(vessels, mmsi=None, name=None):
     return None, [(int(h["mmsi"]), h["name"]) for h in hits]
 
 
-def collect(spark, gold, mmsi, days):
+def collect(spark, gold, mmsi, days, rules=None):
     v = _read(spark, gold, "vessels")
     ident = (v.where(F.col("mmsi") == mmsi).collect() if v is not None else [])
     if not ident:
@@ -76,14 +95,15 @@ def collect(spark, gold, mmsi, days):
     since = (ident["last_seen"] - timedelta(days=days)) if ident.get("last_seen") else datetime(1970, 1, 1)
     sel = lambda t, ts: (lambda df: None if df is None else
                          df.where((F.col("mmsi") == mmsi) & (F.col(ts) >= F.lit(since))))(_read(spark, gold, t))
-    tracks = _rows(sel("vessel_tracks", "slot_ts"), ["slot_ts", "lat", "lon", "sog_kn", "inst_name"])
+    tracks = _rows(sel("vessel_tracks", "slot_ts"), ["slot_ts", "lat", "lon", "sog_kn", "inst_name", "dist_m"])
     tracks.sort(key=lambda r: r["slot_ts"])
     visits = _rows(sel("vessel_visits", "arrival_ts"), ["inst_name", "inst_kind", "is_onshore", "arrival_ts",
                    "departure_ts", "duration_min", "min_dist_m", "entered_zone"], "arrival_ts")
     zones = _rows(sel("zone_entries", "entry_ts"), ["inst_name", "entry_ts", "exit_ts", "minutes_inside",
                   "min_dist_m", "max_sog_kn", "avg_sog_kn"], "entry_ts")
     ev_cols = ["event_type", "inst_name", "start_ts", "end_ts", "duration_min", "min_dist_m", "regular_visitor",
-               "is_facility", "terminal_call", "support_craft", "worth_a_look"]
+               "days_present_before", "is_facility", "censored", "feed_outage", "terminal_call", "support_craft",
+               "worth_a_look", "length_m", "is_onshore"]
     events = (_rows(sel("loitering_events", "start_ts"), ev_cols) + _rows(sel("ais_gap_events", "start_ts"), ev_cols))
     events.sort(key=lambda r: r["start_ts"], reverse=True)
     days_t = _rows(sel("vessel_days", "first_ts"), ["dt", "n_msgs", "n_near", "n_zone", "installations",
@@ -97,11 +117,15 @@ def collect(spark, gold, mmsi, days):
     pos = {p["inst_name"]: (p["lat"], p["lon"]) for p in places}
     for r in zones + events:
         r["lat"], r["lon"] = pos.get(r.get("inst_name"), (None, None))
+    place_visits(visits, tracks, "arrival_ts", "departure_ts")
+    place_visits(zones, tracks, "entry_ts", "exit_ts")
     stats = {"km": round(track_km(tracks)), "visits": len(visits), "installations": len(names),
              "zone_entries": len(zones), "zone_minutes": round(sum(r.get("minutes_inside") or 0 for r in zones)),
              "events": len(events), "worth_a_look": sum(1 for r in events if r.get("worth_a_look")),
              "days_active": len(days_t)}
-    return {"vessel": ident, "since": since, "days": days, "stats": stats, "track": tracks, "visits": visits,
+    missing = [t for t in ("vessel_tracks", "vessel_visits", "zone_entries", "loitering_events", "ais_gap_events")
+               if _read(spark, gold, t) is None]
+    return {"vessel": ident, "rules": rules or {}, "missing_tables": missing, "since": since, "days": days, "stats": stats, "track": tracks, "visits": visits,
             "zones": zones, "events": events, "daily": days_t, "places": places}
 
 
@@ -135,7 +159,11 @@ def main():
     if mmsi is None:
         sys.exit("no vessel with that name" if not choices else
                  "several matches, use --mmsi:\n" + "\n".join(f"  {m}  {n}" for m, n in choices))
-    data = collect(spark, gold, mmsi, a.days)
+    rv, sc = cfg.get("regular_visitor", {}), cfg.get("surveillance", {})
+    rules = {"min_days": rv.get("min_days", 3), "window_days": rv.get("window_days", 30),
+             "large_ship_min_m": sc.get("large_ship_min_m", 100), "loiter_max_kn": sc.get("loiter_max_kn", 2.0),
+             "loiter_min_minutes": sc.get("loiter_min_minutes", 120), "ais_gap_min_minutes": sc.get("ais_gap_min_minutes", 30)}
+    data = collect(spark, gold, mmsi, a.days, rules)
     if data is None:
         sys.exit(f"MMSI {mmsi} not found in {gold}/vessels")
     print(render(data, os.path.join(a.out, f"vessel_{mmsi}.html")))
@@ -164,11 +192,14 @@ th,td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;white
 th{color:var(--muted);font-weight:500}td.n{text-align:right;font-variant-numeric:tabular-nums}
 .tag{display:inline-block;font-size:.75rem;padding:0 6px;border-radius:4px;border:1px solid var(--line);margin-right:4px}
 .tag.look{border-color:var(--warn);color:var(--warn);font-weight:500}
+.vnum{width:22px;height:22px;border-radius:50%;background:var(--accent);color:var(--surface);font-size:11px;font-weight:600;
+  display:flex;align-items:center;justify-content:center;border:2px solid var(--surface);box-shadow:0 0 0 1px var(--accent)}
+.why{white-space:normal;min-width:320px;max-width:520px;font-size:.8125rem;color:var(--muted);line-height:1.4}
 </style></head><body><main>
 <h1 id="name"></h1><p class="sub" id="ident"></p>
 <ul class="kpis" id="kpis"></ul>
 <section><h2>Route</h2><p class="note" id="mapnote"></p><div id="map"></div></section>
-<section><h2>Surveillance events</h2><p class="note">Loitering and AIS gaps; flags show the ordinary explanation, if any</p><div class="scroll" id="events"></div></section>
+<section><h2>Surveillance events</h2><p class="note" id="evnote"></p><div class="scroll" id="events"></div></section>
 <section><h2>Safety-zone entries</h2><div class="scroll" id="zones"></div></section>
 <section><h2>Visits to installations</h2><div class="scroll" id="visits"></div></section>
 <section><h2>Day by day</h2><div class="scroll" id="daily"></div></section>
@@ -208,6 +239,31 @@ function table(id, rows, cols){
   }
   tb.append(body); box.append(tb);
 }
+const R = Object.assign({min_days: 3, window_days: 30, large_ship_min_m: 100, loiter_max_kn: 2, loiter_min_minutes: 120,
+                         ais_gap_min_minutes: 30}, D.rules || {});
+function what(r){
+  return r.event_type === 'ais_gap'
+    ? 'silent for ' + dur(r.duration_min) + ' (at least ' + R.ais_gap_min_minutes + ' min) between two positions near ' + r.inst_name + ', sending nothing anywhere in between'
+    : 'stayed under ' + R.loiter_max_kn + ' kn within 5 km of ' + r.inst_name + ' for ' + dur(r.duration_min) + ' (at least ' + dur(R.loiter_min_minutes) + ')';
+}
+function why(r){
+  const days = r.days_present_before == null ? 'unknown' : r.days_present_before;
+  const regularTxt = 'present at ' + r.inst_name + ' on ' + days + ' of the previous ' + R.window_days + ' days';
+  if (r.worth_a_look) {
+    return 'Worth a look: it ' + what(r) + '. None of the ordinary explanations applies: ' + regularTxt + ' (' + R.min_days +
+      ' needed to count as a regular visitor), not an installation or rig broadcasting AIS, not a large ship (' +
+      R.large_ship_min_m + ' m or more) at an onshore terminal, not a craft named after the installation, and the AIS feed was complete' +
+      (r.event_type === 'ais_gap' ? ' during the gap.' : ' when it started.');
+  }
+  const reasons = [];
+  if (r.regular_visitor) reasons.push('regular visitor: ' + regularTxt + ' (' + R.min_days + ' or more counts as regular)');
+  if (r.is_facility) reasons.push('the vessel is itself an installation or rig in Sodir\'s list, stationary at the time');
+  if (r.terminal_call) reasons.push('a ' + (r.length_m || 'large') + ' m ship at an onshore terminal, typically waiting to berth');
+  if (r.support_craft) reasons.push('its name contains the installation\'s name, so it belongs to it (rescue or daughter craft)');
+  if (r.censored) reasons.push('it began right after a gap in the AIS feed or the start of the data, so its real start is unknown');
+  if (r.feed_outage) reasons.push('the whole AIS feed was quiet during the gap, not just this vessel');
+  return 'Ordinary: ' + (reasons.join('; ') || 'no flag recorded') + '.';
+}
 function flags(r){
   const w = document.createElement('span');
   const add = (txt, cls) => { const s = document.createElement('span'); s.className = 'tag' + (cls ? ' ' + cls : ''); s.textContent = txt; w.append(s); };
@@ -217,7 +273,11 @@ function flags(r){
   return w;
 }
 table('events', D.events, [['Type', r => r.event_type === 'ais_gap' ? 'AIS gap' : 'loitering'], ['Installation', r => r.inst_name],
-  ['Start (UTC)', r => t(r.start_ts)], ['Duration', r => dur(r.duration_min), 1], ['Closest', r => num(r.min_dist_m) + ' m', 1], ['Flags', flags]]);
+  ['Start (UTC)', r => t(r.start_ts)], ['Duration', r => dur(r.duration_min), 1], ['Closest', r => num(r.min_dist_m) + ' m', 1], ['Flags', flags],
+  ['Why', r => { const d = document.createElement('div'); d.className = 'why'; d.textContent = why(r); return d; }]]);
+$('evnote').textContent = 'Loitering and AIS gaps near installations, newest first. "Why" explains each one: the ordinary reason it is not a concern, or, for events worth a look, why none of those reasons applies.';
+const miss = D.missing_tables || [];
+if (miss.length) $('mapnote').textContent = 'Not available yet in this Gold folder: ' + miss.join(', ') + '. Run Gold (a full run after an upgrade) and rebuild this report.';
 table('zones', D.zones, [['Installation', r => r.inst_name], ['Entry (UTC)', r => t(r.entry_ts)], ['Inside', r => dur(r.minutes_inside), 1],
   ['Closest', r => num(r.min_dist_m) + ' m', 1], ['Top speed', r => r.max_sog_kn == null ? '–' : r.max_sog_kn.toFixed(1) + ' kn', 1]]);
 table('visits', D.visits, [['Installation', r => r.inst_name], ['Type', r => (r.inst_kind || '').toLowerCase() + (r.is_onshore ? ' (onshore)' : '')],
@@ -247,12 +307,28 @@ for (const p of D.places) {
     .bindTooltip(p.inst_name + ': ' + p.visits + ' visit' + (p.visits === 1 ? '' : 's') + (p.field ? ' (' + p.field + ')' : '')).addTo(map);
   bounds.push([p.lat, p.lon]);
 }
+const instPos = Object.fromEntries(D.places.map(p => [p.inst_name, [p.lat, p.lon]]));
+const visitsInOrder = D.visits.slice().sort((a, b) => Date.parse(a.arrival_ts) - Date.parse(b.arrival_ts));
+visitsInOrder.forEach((v, i) => {
+  if (v.ship_lat == null) return;
+  const here = [v.ship_lat, v.ship_lon];
+  if (instPos[v.inst_name]) L.polyline([here, instPos[v.inst_name]], {color: css('--muted'), weight: 1, dashArray: '3 4'}).addTo(map);
+  const icon = L.divIcon({className: '', iconSize: [22, 22], iconAnchor: [11, 11],
+    html: '<div class="vnum">' + (i + 1) + '</div>'});
+  L.marker(here, {icon}).bindTooltip('Visit ' + (i + 1) + ': ' + v.inst_name + '<br>' + t(v.arrival_ts) + ' to ' + t(v.departure_ts) +
+    ' UTC<br>Stay ' + dur(v.duration_min) + ', closest ' + num(v.min_dist_m) + ' m' + (v.entered_zone ? ', entered 500 m zone' : '')).addTo(map);
+  bounds.push(here);
+});
+for (const z of D.zones.filter(z => z.ship_lat != null))
+  L.circleMarker([z.ship_lat, z.ship_lon], {radius: 4, color: css('--signal'), weight: 1, fillColor: css('--signal'), fillOpacity: 0.9})
+    .bindTooltip('Zone entry ' + z.inst_name + ': ' + t(z.entry_ts) + ', ' + dur(z.minutes_inside) + ' inside, closest ' + num(z.min_dist_m) + ' m').addTo(map);
 for (const e of D.events.filter(e => e.lat != null && e.worth_a_look))
   L.circleMarker([e.lat, e.lon], {radius: 9, color: css('--warn'), weight: 2, fill: false})
     .bindTooltip((e.event_type === 'ais_gap' ? 'AIS gap ' : 'Loitering ') + dur(e.duration_min) + ' at ' + e.inst_name + ', ' + t(e.start_ts)).addTo(map);
 if (bounds.length) map.fitBounds(bounds, {padding: [24, 24]}); else map.setView([62.5, 4], 5);
-$('mapnote').textContent = pts.length + ' track points (one per 10 minutes); line breaks where the vessel was silent for over 2 hours. ' +
-  'Circles are installations it visited (violet: onshore); orange rings mark events worth a look.';
+if (!miss.length) $('mapnote').textContent = pts.length + ' track points (one per 10 minutes); line breaks where the vessel was silent for over 2 hours. ' +
+  'Numbered markers show where the ship was during each visit (closest approach, dashed line to the installation); ' +
+  'yellow dots are safety-zone entries; outlined circles are the installations (violet: onshore); orange rings mark events worth a look.';
 })();
 </script></body></html>
 '''
