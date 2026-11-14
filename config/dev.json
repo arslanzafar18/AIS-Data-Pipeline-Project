@@ -44,5 +44,6 @@
     "max_silver_staleness_min": null,
     "max_sog_glitch_rate": 0.001
   },
-  "max_ship_kn": 50
+  "max_ship_kn": 50,
+  "bronze_retention_days": 14
 }

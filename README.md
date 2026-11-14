@@ -27,6 +27,12 @@ All commands from `~/AIS-Data-Pipeline-Project`. `PY=/home/ubuntu/spark-env/bin/
 | `ais-collector` | Bronze: live stream → one gzip file per 120 s | `metrics/prod/events.jsonl`, `journalctl -u ais-collector` |
 | `ais-pipeline-loop` | Silver every 120 s, Gold hourly (gated, incremental) | `logs/silver_prod.log`, `logs/gold_prod.log` |
 | `sodir-refresh.timer` | Sodir facilities → `bronze/reference` (Mondays 05:00 UTC) | `journalctl -u sodir-refresh` |
+| `bronze-retention.timer` | Deletes live Bronze files older than `bronze_retention_days` (30) that Silver has processed (03:30 UTC) | `journalctl -u bronze-retention` |
+| `ais-dashboard` | Serves the Gold dashboard on localhost:8050 | `journalctl -u ais-dashboard` |
+| `jaeger` | Trace store and UI (localhost:4318 in, localhost:16686 UI) | `journalctl -u jaeger` |
+
+Install the last three once with `scripts/install_ops_services.sh` (it copies the command Jaeger runs with now).
+Preview retention first: `APP_ENV=prod $PY scripts/bronze_retention.py` (dry run: prints how many files and GB would go).
 
 `sudo systemctl status|restart ais-collector ais-pipeline-loop` · `systemctl list-timers sodir-refresh.timer` · health: `APP_ENV=prod $PY scripts/status_report.py`.
 
@@ -37,20 +43,24 @@ python3 -c "import json;m=json.load(open('data/prod/gold/_READY.json'));print(m[
 ls data/prod/gold/_LAST_FAILED.json 2>/dev/null       # present = last Gold run was blocked by the gate
 ```
 
-**When the monitor opens a `pipeline-alert` issue** (the workflow comments on it while failing and closes it when checks pass):
+**When the monitor opens a `pipeline-alert` issue** (checks: heartbeat, Gold READY and age, disk space, message volume) (the workflow comments on it while failing and closes it when checks pass):
 1. *Heartbeat stale*: `sudo systemctl status ais-collector`, then `tail metrics/prod/events.jsonl` (look for `reader_error`, e.g. expired
    BarentsWatch credentials or the stream being down). `sudo systemctl restart ais-collector`.
 2. *Gold not READY*: read `data/prod/gold/_LAST_FAILED.json` (which gate check failed) and `tail -50 logs/gold_prod.log`.
    The previous Gold stays published, so readers are unaffected; fix the cause, the next hourly run publishes again.
 3. *Gold too old*: `pgrep -af spark.gold_job` (a run still going?) and `free -g` (out of memory → see `docs/DESIGN_AND_LIMITS.md`).
+4. *Disk almost full* (under 15% free): `du -sh data/prod/*/* | sort -h | tail`; delete old `silver/positions_old_*` copies,
+   or run retention with fewer days (`scripts/bronze_retention.py --days 14 --apply`).
+5. *Message volume low* (last full hour under half the usual): the stream is up but thin. Check `reader_error` events and
+   the BarentsWatch status; it often recovers by itself, and Gold marks the affected hours as a feed outage.
 
 **Tracing (OpenTelemetry → Jaeger).** Set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` in `.env`; unset, tracing is off.
 Services in Jaeger: `ais-collector` (`bronze.connect`, `bronze.flush`, `bronze.stream_end`, `bronze.reader_error`), `ais-silver`
-(`silver.batch` and its steps), `ais-gold` (`gold.*`, including the gate checks). Jaeger runs from `~/jaeger`, bound to localhost
+(`silver.batch` and its steps), `ais-gold` (`gold.*`, including the gate checks). Jaeger runs as the `jaeger` service from `~/jaeger`, bound to localhost
 (it has no login): forward port 16686 in VS Code (PORTS tab) and open http://localhost:16686. Do not open the port publicly.
 
 **Dashboard and vessel profile.** Gold rebuilds `data/prod/gold/dashboard/index.html` after every publish. To view it:
-`python3 -m http.server 8050 --bind 127.0.0.1 --directory data/prod/gold/dashboard` and forward port 8050.
+the `ais-dashboard` service serves it on localhost:8050; forward port 8050.
 One vessel: `APP_ENV=prod PYTHONPATH=. $PY -m spark.vessel_report --name "ESVAGT AURORA" --days 30` (or `--mmsi N`) → `reports/`.
 
 **Maintenance jobs** (stop the loop first, and only when `pgrep -af spark.gold_job` prints nothing; the collector keeps running, so no data is lost):
