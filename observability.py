@@ -1,4 +1,4 @@
-"""OpenTelemetry tracing for the pipeline (Silver and Gold; collector later).
+"""OpenTelemetry tracing for the pipeline (Bronze collector, Silver and Gold).
 
 Off by default: unless OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_TRACES_EXPORTER is set, every span is a no-op,
 so tests, CI and the demo need nothing. Examples:

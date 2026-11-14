@@ -1,4 +1,4 @@
-import os, time
+import os
 from datetime import date, datetime, timezone
 from spark import gold_plan as gp
 
