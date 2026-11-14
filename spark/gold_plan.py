@@ -6,7 +6,7 @@ Silver files changed since the last successful Gold run) up to the newest day. V
 rebuilt by gold_job from their own arrival (see there). Partitions are swapped in one day at a time; days older than the lookback are dropped.
 """
 import calendar, json, os, shutil
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
 
 def read_json(path):

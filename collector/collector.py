@@ -14,6 +14,7 @@ from pathlib import Path
 
 import requests
 
+import observability as obs
 import pipeline_config
 
 TOKEN_URL = "https://id.barentswatch.no/connect/token"
@@ -46,25 +47,50 @@ def get_token():
     return j["access_token"], time.time() + int(j.get("expires_in", 3600)) - 120
 
 
+def connect(attempt):
+    """Token + open the stream. Traced as one short span; a failure marks it as an error."""
+    with obs.span("bronze.connect", attempt=attempt, source=SOURCE):
+        token, expiry = get_token()
+        resp = requests.get(STREAM_URL, params={"modelType": "Full", "modelFormat": "Json"},
+                            headers={"Authorization": f"Bearer {token}"},
+                            stream=True, timeout=(15, 90))
+        try:
+            resp.raise_for_status()
+        except Exception:
+            resp.close()
+            raise
+        obs.annotate(http_status=resp.status_code)
+        return resp, expiry
+
+
 def reader():
     """Connect, read lines, reconnect with backoff; refresh token before expiry."""
-    backoff = 1
+    backoff, attempt = 1, 0
     while not stop.is_set():
+        attempt += 1
         try:
-            token, expiry = get_token()
-            with requests.get(STREAM_URL, params={"modelType": "Full", "modelFormat": "Json"},
-                              headers={"Authorization": f"Bearer {token}"},
-                              stream=True, timeout=(15, 90)) as resp:
-                resp.raise_for_status()
-                backoff = 1
+            resp, expiry = connect(attempt)
+            backoff, started, n, reason = 1, time.time(), 0, "stream_closed"
+            with resp:
                 for line in resp.iter_lines():
-                    if stop.is_set() or time.time() > expiry:
+                    if stop.is_set():
+                        reason = "stopping"
+                        break
+                    if time.time() > expiry:
+                        reason = "token_refresh"
                         break           # outer loop reconnects with a fresh token
                     if line:
+                        n += 1
                         with lock:
                             buffer.append((utcnow().isoformat(), line.decode("utf-8", "replace")))
+            # A stream lasts up to an hour, so it is not one long span: a short span records how it ended.
+            with obs.span("bronze.stream_end", reason=reason, messages=n,
+                          duration_s=round(time.time() - started, 1), attempt=attempt):
+                pass
         except Exception as e:
             log_event("reader_error", error=repr(e), backoff=backoff)
+            with obs.span("bronze.reader_error", error=repr(e)[:300], backoff_s=backoff, attempt=attempt):
+                obs.mark_error(type(e).__name__)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -83,12 +109,19 @@ def log_event(kind, **kw):
 
 
 def flush(window_start, window_end):
+    with obs.span("bronze.flush", source=SOURCE, run_id=RUN_ID):
+        _flush(window_start, window_end)
+
+
+def _flush(window_start, window_end):
     with lock:
         batch = buffer[:]
         buffer.clear()
     secs = (window_end - window_start).total_seconds()
     if not batch:
         log_event("flush", file=None, messages=0, bytes_raw=0, bytes_gz=0, window_s=secs)
+        obs.annotate(messages=0, window_s=secs)
+        obs.event("empty_window")
         return
     d = BRONZE_DIR / f"dt={window_end:%Y-%m-%d}" / f"hour={window_end:%H}"
     d.mkdir(parents=True, exist_ok=True)
@@ -102,8 +135,11 @@ def flush(window_start, window_end):
             f.write(s + "\n")
     final = d / name
     tmp.rename(final)
+    gz = final.stat().st_size
     log_event("flush", file=str(final), messages=len(batch), bytes_raw=raw_bytes,
-              bytes_gz=final.stat().st_size, window_s=secs)
+              bytes_gz=gz, window_s=secs)
+    obs.annotate(messages=len(batch), bytes_raw=raw_bytes, bytes_gz=gz, window_s=secs,
+                 file=name, partition=f"dt={window_end:%Y-%m-%d}/hour={window_end:%H}")
     (METRICS_DIR / "heartbeat.json").write_text(json.dumps(
         {"ts": utcnow().isoformat(), "run_id": RUN_ID, "last_file": name, "messages": len(batch)}))
 
@@ -112,6 +148,7 @@ def main():
     if not CLIENT_ID or not CLIENT_SECRET:
         sys.exit("Set BW_CLIENT_ID and BW_CLIENT_SECRET")
     BRONZE_DIR.mkdir(parents=True, exist_ok=True)
+    obs.init("ais-collector", CFG["env"])     # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     threading.Thread(target=reader, daemon=True).start()
