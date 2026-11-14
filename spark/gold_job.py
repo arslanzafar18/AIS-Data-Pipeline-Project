@@ -312,8 +312,7 @@ def main(full=False):
         from spark.common import load_facilities
         with obs.span("gold.dashboard"):
             fac = load_facilities(spark, dict(cfg, facility_filter=None), P("bronze/reference/facilities.csv"))
-            dashboard.build(spark.read.parquet(P("gold/vessel_visits")),
-                            spark.read.parquet(P("gold/installation_activity_hourly")), manifest, P("gold/dashboard"), fac=fac)
+            dashboard.build_from_gold(spark, P("gold"), manifest, P("gold/dashboard"), cfg, fac=fac)
     except Exception as e:
         print(f"dashboard not updated: {e!r}")
 
