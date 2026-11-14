@@ -308,6 +308,8 @@ button.plain{font:inherit;color:var(--accent);background:var(--surface);border:1
 .dot.ring{background:transparent;border:3px solid var(--warn);opacity:1}
 .sizes{display:inline-flex;align-items:center;gap:2px}.sizes span{display:inline-block;border-radius:50%;border:1.5px solid var(--muted)}
 .sizes span:nth-child(1){width:6px;height:6px}.sizes span:nth-child(2){width:10px;height:10px}.sizes span:nth-child(3){width:14px;height:14px}
+.risk{display:inline-block;font-size:.75rem;font-weight:600;padding:0 8px;border-radius:4px}
+.risk.h{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}.risk.m{background:color-mix(in srgb,var(--signal) 18%,transparent);color:var(--ink)}.risk.l{background:color-mix(in srgb,var(--line) 60%,transparent);color:var(--muted)}
 .glance{margin:12px 0 0;max-width:90ch}.glance:empty{display:none}
 .search input{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);min-width:320px}
 code{font-size:.8125rem;background:color-mix(in srgb,var(--line) 50%,transparent);padding:1px 5px;border-radius:4px}
@@ -381,9 +383,12 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
     <details class="help" open><summary>How to read and use this page</summary>
       <dl class="defs">
         <dt>Zone entry</dt><dd>A vessel inside an installation's 500 m safety zone; 30 minutes without a position inside starts a new entry. Only vessels with permission may enter.</dd>
-        <dt>Fast entry</dt><dd>A zone entry with a speed over <span class="rv" data-r="fast_kn"></span> kn recorded inside 500 m, not counting rescue boats. Speeds above 50 kn are GPS errors and already removed; a single fast reading can still be noise, repeated ones are worth checking.</dd>
-        <dt>Rescue boat</dt><dd>A fast rescue boat or daughter craft (name contains FRB, MOB, DC or DAUGHTER). They run at 25 to 30 kn in drills and crew transfers, so they are listed apart and not counted as fast entries.</dd>
-        <dt>Offshore fleet</dt><dd>Vessels that entered the 500 m zone of at least 2 different offshore installations, or at least 5 times in total, in the whole data period. Supply, standby, diving and crew vessels fall in this group whatever ship type their AIS reports (many supply vessels report "cargo").</dd>
+        <dt>Fast entry</dt><dd>A zone entry with a speed over <span class="rv" data-r="fast_kn"></span> kn recorded inside 500 m. Speeds above 50 kn are GPS errors and already removed; a single fast reading can still be noise, repeated ones are worth checking.</dd>
+        <dt>Risk</dt><dd>Collision energy grows with a vessel's mass and the square of its speed, so fast entries are ranked by size and speed together.
+          <b>High</b>: 80 m or longer at over 10 kn, or 24 to 80 m at over 15 kn. <b>Medium</b>: 24 to 80 m at 10 to 15 kn, or length unknown.
+          <b>Low</b>: under 24 m, or a rescue craft. These thresholds are this dashboard's own judgement, not an industry standard.</dd>
+        <dt>Rescue craft</dt><dd>A fast rescue boat or daughter craft launched from a standby vessel for drills, crew transfers and call-outs: AIS type "search and rescue" under 24 m, or a name containing FRB, FRC, MOB, DC (with or without a number) or DAUGHTER. They are built to run at 25 to 30 kn, so they rank as low risk.</dd>
+        <dt>Offshore fleet</dt><dd>Vessels that entered the 500 m zone of at least 2 different offshore installations, or at least 5 times in total, or made at least 10 visits within 5 km of offshore installations, in the whole data period. Supply, standby, diving and crew vessels fall in this group whatever ship type their AIS reports (many supply vessels report "cargo").</dd>
         <dt>Unexpected entry</dt><dd>An entry into an offshore installation's 500 m zone by a fishing vessel, or by a vessel outside the offshore fleet: a ship that almost never comes inside any safety zone.</dd>
         <dt>Fishing vessel</dt><dd>Registered in the Norwegian fishing vessel register (Fiskeridirektoratet, matched on radio call sign), or reporting AIS ship type "fishing". Foreign fishing vessels are only found by their AIS type, and boats under 15 m often carry no AIS.</dd>
         <dt>Vessel presence</dt><dd>The share of hours with at least one vessel within 5 km of an offshore installation. Hours when the whole feed was thin are left out. Offshore Norge guideline 064 sets rescue times (a person overboard picked up within 8 min; a ditched helicopter or evacuation to sea rescued within 120 min) but no fixed distance for standby vessels, and one vessel often covers several installations. So presence is context, not a test of those requirements.</dd>
@@ -404,8 +409,7 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
     <div class="map" id="mapZ"></div></section>
   <section><h2>Unexpected zone entries</h2><p class="note">Fishing vessels and vessels outside the offshore fleet inside 500 m of an offshore installation, newest first.</p><div class="scroll" id="tUnexp"></div></section>
   <section><h2>Fishing vessels near installations</h2><p class="note" id="nFish"></p><div class="scroll" id="tFish"></div></section>
-  <section><h2>Fast zone entries</h2><p class="note" id="noteFast"></p><div class="scroll" id="tFast"></div></section>
-  <section><h2>Rescue boat activity</h2><p class="note">Fast rescue boats and daughter craft inside 500 m: drills, crew transfers and real call-outs. Listed so their high speeds are not mistaken for risky entries.</p><div class="scroll" id="tRescue"></div></section>
+  <section><h2>Fast zone entries by risk</h2><p class="note" id="noteFast"></p><div class="scroll" id="tFast"></div></section>
   <section><h2 id="hPrep">Vessel presence and helideck landings</h2><p class="note" id="nPrep"></p><div class="scroll" id="tPrep"></div></section>
 </div>
 
@@ -584,18 +588,30 @@ function focus(mapId, name){ const M = maps[mapId]; const m = M && M.markers[nam
 
 // ---------- Safety zones and emergency preparedness ----------
 const HL = D.hl || {i:[], t:[], d:[]}, GP = D.gp || {i:[], t:[], n:[]}, OUT = new Set(D.out || []);
-const RESCUE = /\b(FRB|MOB|DC|DAUGHTER)\b/;
-const isRescue = m => RESCUE.test(((VES[m] && VES[m][0]) || '').toUpperCase());
+const RESCUE = /\b(FRB|FRC|MOB|DC\d*|DAUGHTER)\b/;
+const vlen = m => VES[m] && VES[m][2] ? VES[m][2] : null;
+const isRescue = m => RESCUE.test(((VES[m] && VES[m][0]) || '').toUpperCase()) || (VES[m] && VES[m][1] === 51 && (vlen(m) == null || vlen(m) < 24));
+function risk(r){                            // [level 0 high .. 2 low, label, reason]
+  const L = vlen(r.m), kn = r.kn;
+  if (isRescue(r.m)) return [2, 'Low', 'rescue craft, built for these speeds'];
+  if (L == null) return [1, 'Medium', 'length unknown at ' + kn.toFixed(1) + ' kn'];
+  if (L < 24) return [2, 'Low', L + ' m: small craft'];
+  if (L >= 80) return [0, 'High', L + ' m at ' + kn.toFixed(1) + ' kn: large and fast'];
+  return kn > 15 ? [0, 'High', L + ' m at ' + kn.toFixed(1) + ' kn: mid-size and very fast'] : [1, 'Medium', L + ' m at ' + kn.toFixed(1) + ' kn: mid-size'];
+}
 const fishReg = m => !!(VES[m] && VES[m][4]), fishAis = m => !!(VES[m] && VES[m][1] === 30), isFishing = m => fishReg(m) || fishAis(m);
 const FLEET = (() => {                       // zone entries per vessel at offshore installations over the whole data period
   const n = new Map(), inst = new Map();
   for (let k = 0; k < Z.t.length; k++) { if (I[Z.i[k]][2]) continue; const m = Z.m[k];
     n.set(m, (n.get(m) || 0) + 1); if (!inst.has(m)) inst.set(m, new Set()); inst.get(m).add(Z.i[k]); }
-  return {n, inst, has: m => (inst.get(m) || new Set()).size >= 2 || (n.get(m) || 0) >= 5};
+  const near = new Map();                    // visits within 5 km of offshore installations
+  for (let k = 0; k < V.t.length; k++) if (!I[V.i[k]][2]) near.set(V.m[k], (near.get(V.m[k]) || 0) + 1);
+  return {n, inst, near, has: m => (inst.get(m) || new Set()).size >= 2 || (n.get(m) || 0) >= 5 || (near.get(m) || 0) >= 10};
 })();
 const fishSource = m => fishReg(m) ? 'fishing register' : fishAis(m) ? 'AIS type fishing' : '';
 const unexpectedWhy = m => isFishing(m) ? 'fishing vessel (' + fishSource(m) + ')'
-  : 'rarely in safety zones: ' + (FLEET.n.get(m) || 0) + ' entries at ' + (FLEET.inst.get(m) || new Set()).size + ' installation(s) in all data';
+  : 'rarely near installations: ' + (FLEET.n.get(m) || 0) + ' zone entries at ' + (FLEET.inst.get(m) || new Set()).size +
+    ' installation(s) and ' + (FLEET.near.get(m) || 0) + ' visits within 5 km in all data';
 function zoneRows(filterMmsi){
   const rows = [];
   for (let k = 0; k < Z.t.length; k++) {
@@ -624,7 +640,7 @@ function safety(){
   $('sq').value = sel == null ? '' : I[sel][0]; $('sclear').hidden = sel == null;
   document.querySelectorAll('.rv').forEach(e => e.textContent = R[e.dataset.r]);
   const all = zoneRows(null), rows = sel == null ? all : all.filter(r => r.ii === sel), per = new Map();
-  const isFast = r => r.kn != null && r.kn > R.fast_kn && !isRescue(r.m), fast = rows.filter(isFast), rescue = rows.filter(r => isRescue(r.m));
+  const isFast = r => r.kn != null && r.kn > R.fast_kn, fast = rows.filter(isFast).map(r => ({...r, risk: risk(r)}));
   const prior = earlierEntries();
   const unexp = rows.filter(r => !r.on && !isRescue(r.m) && (isFishing(r.m) || !FLEET.has(r.m)))
                     .map(r => ({...r, before: prior.get(r.m + '|' + r.ii).filter(t => t < r.t).length}));
@@ -636,7 +652,7 @@ function safety(){
   const prep = preparedness().filter(r => sel == null || r.ii === sel);
   const landings = prep.reduce((s, r) => s + r.land, 0);
   kpis('kpis', [[num(rows.length), 'zone entries'], [num(unexp.length), 'unexpected entries'], [num(new Set(fishVisits.map(r => r.m)).size), 'fishing vessels within 5 km'],
-    [num(fast.length), 'faster than ' + R.fast_kn + ' kn'], [num(landings), 'helideck landings']]);
+    [num(fast.filter(r => r.risk[0] === 0).length), 'high-risk fast entries'], [num(landings), 'helideck landings']]);
   const g = $('sglance');
   if (sel == null) g.textContent = '';
   else { const p = prep[0];
@@ -660,11 +676,12 @@ function safety(){
     ['Vessel within 5 km', r => r.cover == null ? '–' : r.cover.toFixed(1) + '% of hours', 1], ['Longest time without', r => r.longest ? r.longest + ' h' : 'none', 1],
     ['It started (UTC)', r => r.longT == null ? '–' : at(r.longT)],
     ['Helideck landings', r => num(r.land), 1], ['Last landing (UTC)', r => r.lastLand < 0 ? '–' : at(r.lastLand)]], r => pick(r.ii));
-  $('noteFast').textContent = 'Entries where a speed above ' + R.fast_kn + ' kn was recorded inside 500 m, fastest first. Speed, size and closeness together decide the risk.';
-  const ty = r => SHIP(VES[r.m] && VES[r.m][1]), len = r => VES[r.m] && VES[r.m][2] ? VES[r.m][2] + ' m' : '–';
-  table('tFast', fast.sort((a, b) => b.kn - a.kn || (a.x ?? 1e9) - (b.x ?? 1e9)), [['Vessel', r => vlink(r.m)], ['Type', ty], ['Length', len, 1],
+  $('noteFast').textContent = 'Entries with a speed above ' + R.fast_kn + ' kn inside 500 m, highest risk first, then fastest. Risk combines size and speed (see How to read this page).';
+  const ty = r => SHIP(VES[r.m] && VES[r.m][1]), len = r => vlen(r.m) ? vlen(r.m) + ' m' : '–';
+  const tag = r => el('span', r.risk[1], 'risk ' + 'hml'[r.risk[0]]);
+  table('tFast', fast.sort((a, b) => a.risk[0] - b.risk[0] || b.kn - a.kn), [['Risk', tag], ['Vessel', r => vlink(r.m)], ['Type', ty], ['Length', len, 1],
     ['Installation', r => r.inst], ['Entry (UTC)', r => at(r.t)], ['Top speed', r => r.kn.toFixed(1) + ' kn', 1], ['Closest', r => num(r.x) + ' m', 1],
-    ['Inside', r => dur(r.d), 1]], r => pick(r.ii));
+    ['Inside', r => dur(r.d), 1], ['Why this risk', r => r.risk[2]]], r => pick(r.ii));
   table('tUnexp', unexp.sort((a, b) => b.t - a.t), [['Vessel', r => vlink(r.m)], ['Type', ty], ['Length', len, 1], ['Installation', r => r.inst],
     ['Entry (UTC)', r => at(r.t)], ['Inside', r => dur(r.d), 1], ['Closest', r => num(r.x) + ' m', 1],
     ['Top speed', r => r.kn == null ? '–' : r.kn.toFixed(1) + ' kn', 1], ['Earlier entries here', r => r.before ? num(r.before) : 'first time', 1],
@@ -673,8 +690,6 @@ function safety(){
     ? 'Norwegian vessels are identified from the fishing vessel register; others by AIS type.' : 'The fishing vessel register is not loaded yet, so only AIS type "fishing" is used.');
   table('tFish', fishVisits.sort((a, b) => b.t - a.t), [['Vessel', r => vlink(r.m)], ['Identified by', r => fishSource(r.m)], ['Length', len, 1],
     ['Installation', r => r.inst], ['Arrived (UTC)', r => at(r.t)], ['Stayed', r => dur(r.d), 1], ['Inside 500 m', r => r.z ? 'yes' : 'no']], r => pick(r.ii));
-  table('tRescue', rescue.sort((a, b) => b.t - a.t), [['Boat', r => vlink(r.m)], ['Installation', r => r.inst], ['Entry (UTC)', r => at(r.t)],
-    ['Top speed', r => r.kn == null ? '–' : r.kn.toFixed(1) + ' kn', 1], ['Inside', r => dur(r.d), 1], ['Closest', r => num(r.x) + ' m', 1]], r => pick(r.ii));
 }
 $('sq').addEventListener('change', () => { const v = $('sq').value.trim().toUpperCase(); const ii = I.findIndex(r => r[0] === v); if (ii >= 0) pick(ii); });
 $('sclear').addEventListener('click', () => pick(null));
