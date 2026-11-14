@@ -27,6 +27,7 @@ All commands from `~/AIS-Data-Pipeline-Project`. `PY=/home/ubuntu/spark-env/bin/
 | `ais-collector` | Bronze: live stream → one gzip file per 120 s | `metrics/prod/events.jsonl`, `journalctl -u ais-collector` |
 | `ais-pipeline-loop` | Silver every 120 s, Gold hourly (gated, incremental) | `logs/silver_prod.log`, `logs/gold_prod.log` |
 | `sodir-refresh.timer` | Sodir facilities → `bronze/reference` (Mondays 05:00 UTC) | `journalctl -u sodir-refresh` |
+| `fishing-refresh.timer` | Norwegian fishing vessel register → `bronze/reference/fishing_vessels.csv` (Mondays 05:30 UTC; owners dropped) | `journalctl -u fishing-refresh` |
 | `bronze-retention.timer` | Deletes live Bronze files older than `bronze_retention_days` (30) that Silver has processed (03:30 UTC) | `journalctl -u bronze-retention` |
 | `ais-dashboard` | Serves the Gold dashboard on localhost:8050 | `journalctl -u ais-dashboard` |
 | `jaeger` | Trace store and UI (localhost:4318 in, localhost:16686 UI) | `journalctl -u jaeger` |
@@ -83,7 +84,7 @@ Never merge during a maintenance job: deploy restarts the loop.
 | Path | Purpose |
 |---|---|
 | `collector/` | Bronze collector (stream → 120 s gzip JSONL files, metrics, heartbeat, traces) |
-| `reference/` | Sodir facility list: `fetch_sodir.py` (weekly API refresh), `load_sodir.py` (first load) |
+| `reference/` | Sodir facility list: `fetch_sodir.py` (weekly API refresh), `load_sodir.py` (first load); `fetch_fishing_vessels.py` (fishing vessel register, weekly) |
 | `spark/silver_logic.py`, `silver_job.py` | Silver rules (testable functions) and incremental job |
 | `spark/gold_logic.py`, `gold_job.py`, `gold_plan.py` | Gold tables, incremental plan, quality gate, publish + `_READY.json` |
 | `spark/dashboard.py`, `vessel_report.py` | Gold dashboard (4 tabs, map, date slider) and single-vessel profile |
