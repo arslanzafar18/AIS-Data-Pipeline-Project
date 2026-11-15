@@ -36,6 +36,16 @@ def filter_facilities(df, flt, kind_col):
     return df.where(cond)
 
 
+def facility_columns(cfg):
+    """Columns of bronze/reference/facilities.csv the pipeline reads: name, kind, Sodir number, position, and the
+    columns the facility filter uses."""
+    flt = cfg.get("facility_filter") or {}
+    cols = [cfg.get("facility_name_col", "fclName"), cfg.get("facility_kind_col", "fclKind"),
+            cfg.get("facility_id_col", "fclNpdidFacility"), "centroid_lat", "centroid_lon"]
+    cols += list(flt.get("include", {})) + ([flt["fixed_col"]] if flt.get("fixed_col") else [])
+    return list(dict.fromkeys(cols))
+
+
 def load_facilities(spark, cfg, path):
     """Sodir installation points -> inst_id, inst_name, inst_kind, is_onshore, i_lat, i_lon (filtered per config).
     inst_id is Sodir's own facility number (config facility_id_col): it stays the same when a facility is renamed."""

@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pyspark.sql import functions as F
 
 M_PER_DEG = 111320.0
+SEGMENT_COLUMNS = ["pipeline_id", "name", "label", "medium", "phase", "seg_no", "lon1", "lat1", "lon2", "lat2"]
 CELL_DEG = 0.1
 
 
@@ -30,7 +31,7 @@ def segments_df(spark, path, phases):
         s = s.withColumn(c, F.col(c).cast("double"))
     if phases:
         s = s.where(F.col("phase").isin(list(phases)))
-    return s.select("pipeline_id", "name", "label", "medium", "phase", "seg_no", "lon1", "lat1", "lon2", "lat2")
+    return s.select(*SEGMENT_COLUMNS)
 
 
 def segment_cells(seg, near_m):

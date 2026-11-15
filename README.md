@@ -63,7 +63,7 @@ Services in Jaeger: `ais-collector` (`bronze.connect`, `bronze.flush`, `bronze.s
 (`silver.batch` and its steps), `ais-gold` (`gold.*`, including the gate checks). Jaeger runs as the `jaeger` service from `~/jaeger`, bound to localhost
 (it has no login): forward port 16686 in VS Code (PORTS tab) and open http://localhost:16686. Do not open the port publicly.
 
-**Dashboard and vessel profile.** Gold rebuilds `data/prod/gold/dashboard/index.html` after every publish. To view it:
+**Dashboard and vessel profile.** Gold rebuilds `data/prod/gold/dashboard/index.html` after every run (a run the gate blocked rebuilds it from the published Gold). Its **Pipeline health** tab is the visual health check: freshness of each layer, Bronze columns (each Silver batch records Bronze records missing a contract column, new AIS message fields and expected fields no message carried; each page build checks every reference CSV still has the columns the pipeline reads), messages per hour with feed outages, Silver rejects and batch times, and every Gold run from `data/prod/quality/gold_runs.jsonl` (one line per run: published, blocked or crashed). To view it:
 the `ais-dashboard` service serves it on localhost:8050; forward port 8050.
 One vessel: `APP_ENV=prod PYTHONPATH=. $PY -m spark.vessel_report --name "ESVAGT AURORA" --days 30` (or `--mmsi N`) → `reports/`.
 
@@ -90,7 +90,7 @@ Never merge during a maintenance job: deploy restarts the loop.
 | `reference/` | Sodir facility list: `fetch_sodir.py` (weekly API refresh), `load_sodir.py` (first load); `fetch_fishing_vessels.py` (fishing vessel register, weekly) |
 | `spark/silver_logic.py`, `silver_job.py` | Silver rules (testable functions) and incremental job |
 | `spark/gold_logic.py`, `gold_job.py`, `gold_plan.py` | Gold tables, incremental plan, quality gate, publish + `_READY.json` |
-| `spark/dashboard.py`, `vessel_report.py` | Gold dashboard (4 tabs, map, date slider) and single-vessel profile |
+| `spark/dashboard.py`, `vessel_report.py` | Gold dashboard (5 tabs incl. Pipeline health, map, date slider) and single-vessel profile |
 | `spark/reenrich.py` | Re-apply Silver row rules to existing Silver without reprocessing Bronze |
 | `observability.py` | OpenTelemetry tracing (no-op unless configured) |
 | `config/dev.json`, `config/prod.json` | Environment settings (`APP_ENV`) |

@@ -1,11 +1,13 @@
 """Gold dashboard: one self-contained HTML page, rebuilt after every successful Gold publish.
 
-Four tabs, all driven by one date-range slider and an All / Offshore / Onshore switch:
+Five tabs, all driven by one date-range slider (the first four also by an All / Offshore / Onshore switch):
   Traffic        visits and hourly vessels per installation (use case 1)
   Safety zones   500 m zone entries, fast entries, minutes inside (use case 2)
   Surveillance   loitering and AIS gaps, 'worth a look' first, each with a plain-language Why (use case 3)
   Vessel         search any ship by name or MMSI: its visits, zone entries and events (use case 4);
                  the full route map comes from spark/vessel_report.py
+  Pipeline health  the pipeline itself: freshness, messages per hour with feed outages, Silver rejects and batch
+                 times, and every Gold run (published, blocked by the gate, or crashed) from quality/gold_runs.jsonl
 The Gold tables are embedded compactly (one entry per visit / entry / event / hour) and the browser recomputes
 every number for the chosen range. Writes <gold>/dashboard/index.html atomically; the page reloads itself every
 5 minutes while nobody is using it.
@@ -13,8 +15,8 @@ View it:   python3 -m http.server 8050 --bind 127.0.0.1 --directory <data_root>/
 Preview from any Gold folder (read-only on the tables; writes ./dashboard-preview unless --out is given):
            PYTHONPATH=. python -m spark.dashboard --gold-dir data/prod/gold [--out folder]
 """
-import argparse, json, math, os
-from datetime import datetime
+import argparse, json, math, os, shutil
+from datetime import datetime, timezone
 from pyspark.sql import functions as F
 
 BUCKETS = [(15, "Under 15 min"), (60, "15 to 60 min"), (180, "1 to 3 h"), (720, "3 to 12 h"),
@@ -158,6 +160,120 @@ def read_sar(path):
     return dets, meta
 
 
+REJECT_REASONS = ("parse_failed", "bad_mmsi", "bad_timestamp", "missing_position", "sentinel_position", "out_of_range",
+                  "future_timestamp", "stale_timestamp")
+
+
+def _utc_naive(s):
+    """ISO text with or without offset -> naive UTC datetime (the dashboard's t0 is naive UTC); None if unreadable."""
+    try:
+        d = datetime.fromisoformat(str(s))
+    except (TypeError, ValueError):
+        return None
+    return d.astimezone(timezone.utc).replace(tzinfo=None) if d.tzinfo else d
+
+
+def _jsonl(path):
+    if not path or not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+
+SAR_COLUMNS = ["date", "lat", "lon", "detections", "dataset", "fetched_at"]          # read by read_sar
+FISHING_COLUMNS = ["call_sign"]                                                    # read by load_fishing_call_signs
+
+
+def reference_columns(files):
+    """files: [(label, path, required columns)] -> one row per file: does its header still have every column the
+    pipeline reads? (A fetch already refuses to replace a file whose source changed its fields; this shows it.)"""
+    import csv
+    out = []
+    for label, path, required in files:
+        row = {"file": label, "required": len(required), "columns": None, "missing": [], "updated": None}
+        if path and os.path.exists(path):
+            with open(path, newline="", encoding="utf-8") as f:
+                header = next(csv.reader(f), [])
+            row.update(columns=len(header), missing=[c for c in required if c not in header],
+                       updated=datetime.fromtimestamp(os.path.getmtime(path), timezone.utc).replace(tzinfo=None).isoformat() + "Z")
+        out.append(row)
+    return out
+
+
+def pipeline_health(t0, quality_dir=None, metrics_dir=None, gold_dir=None, now=None, reference=None):
+    """Plain-Python health data for the Pipeline health tab, from files the pipeline already writes:
+    quality/silver_metrics.jsonl (one line per Silver batch) summed per day, quality/gold_runs.jsonl (one line per
+    Gold run), the collector heartbeat and the free disk space. Times are hours since t0 like the rest of the page."""
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    hrs = lambda d: int((d - t0).total_seconds() // 3600)
+    days, last_batch = {}, None
+    for m in _jsonl(quality_dir and os.path.join(quality_dir, "silver_metrics.jsonl")):
+        ts = _utc_naive(m.get("processed_at"))
+        if ts is None:
+            continue
+        last_batch = ts if last_batch is None or ts > last_batch else last_batch
+        if ts < t0:
+            continue
+        d = days.setdefault(ts.date(), {"b": 0, "in": 0, "ok": 0, "dup": 0, "p95": 0, "rt": 0.0, "rtx": 0.0,
+                                        "rej": dict.fromkeys(REJECT_REASONS, 0), "cb": 0, "bad": 0, "unk": {}, "abs": None, "lat": []})
+        if "absent_keys" in m:                       # Bronze column check (batches written since it exists)
+            d["cb"] += 1
+            d["bad"] += m.get("bronze_contract_bad_rows") or 0
+            for k, n in (m.get("unknown_keys") or {}).items():
+                d["unk"][k] = d["unk"].get(k, 0) + n
+            a = set(m.get("absent_keys") or [])
+            d["abs"] = a if d["abs"] is None else d["abs"] & a        # absent from EVERY checked batch of the day
+        d["b"] += 1
+        d["in"] += m.get("input_rows") or 0
+        d["ok"] += m.get("accepted_rows") or 0
+        d["dup"] += (m.get("in_batch_duplicates") or 0) + (m.get("cross_batch_duplicates") or 0)
+        if m.get("source", "live") == "live":              # backfill batches are weeks old by design
+            d["p95"] = max(d["p95"], m.get("latency_p95_s") or 0)
+            d["lat"].append(m.get("latency_p95_s") or 0)
+        d["rt"] += m.get("runtime_s") or 0
+        d["rtx"] = max(d["rtx"], m.get("runtime_s") or 0)
+        for r in REJECT_REASONS:
+            d["rej"][r] += m.get("rej_" + r) or 0
+    order = sorted(days)
+    sv = {"t": [(k - t0.date()).days * 24 for k in order]}
+    for f in ("b", "in", "ok", "dup", "p95", "rtx"):
+        sv[f] = [round(days[k][f], 1) for k in order]
+    med = lambda a: sorted(a)[len(a) // 2] if a else 0
+    sv["p95m"] = [med(days[k]["lat"]) for k in order]      # typical batch; p95 keeps the worst batch of the day
+    sv["rt"] = [round(days[k]["rt"] / days[k]["b"], 1) for k in order]
+    sv["rej"] = {r: [days[k]["rej"][r] for k in order] for r in REJECT_REASONS}
+    sv["cb"] = [days[k]["cb"] for k in order]
+    sv["bad"] = [days[k]["bad"] for k in order]
+    sv["unk"] = [days[k]["unk"] for k in order]
+    sv["abs"] = [sorted(days[k]["abs"] or []) for k in order]
+    runs = []
+    for r in _jsonl(quality_dir and os.path.join(quality_dir, "gold_runs.jsonl")):
+        fin = _utc_naive(r.get("finished_at"))
+        if fin is None or fin < t0:
+            continue
+        runs.append({"t": hrs(fin), "at": fin.isoformat() + "Z", "s": r.get("status"), "m": r.get("mode"),
+                     "rt": r.get("runtime_s"), "n": r.get("checks"), "f": r.get("failed") or [], "w": r.get("warnings") or [],
+                     "k": r.get("repeated_keys"), "rows": r.get("silver_rows"), "from": r.get("recompute_from")})
+    hb = None
+    hb_path = metrics_dir and os.path.join(metrics_dir, "heartbeat.json")
+    if hb_path and os.path.exists(hb_path):
+        try:
+            hb = _utc_naive(json.load(open(hb_path)).get("ts"))
+        except (OSError, ValueError):
+            hb = None
+    disk = None
+    if gold_dir and os.path.isdir(gold_dir):
+        u = shutil.disk_usage(gold_dir)
+        disk = round(100.0 * u.free / u.total, 1)
+    iso = lambda d: None if d is None else d.isoformat() + "Z"
+    return {"built": iso(now), "heartbeat": iso(hb), "silver_batch": iso(last_batch), "disk_free_pct": disk,
+            "sv": sv, "runs": runs, "ref": reference_columns(reference or [])}
+
+
 def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=None, gaps=None, outage_hours=None,
               fishing_call_signs=None, extra_mmsi=None):
     """Compact, column-wise data: one entry per visit, zone entry, event and hour, so the browser can recompute
@@ -229,7 +345,8 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=No
 
 def build(visits, hourly, manifest, out_dir, fac=None, zones=None, events=None, vessels=None, installations=None,
           rules=None, landings=None, coverage=None, min_fraction=0.5, fishing_call_signs=None, pipeline_loiter=None,
-          pipelines_csv=None, sar_csv=None, dark_inst_m=5000, dark_pipe_m=2000):
+          pipelines_csv=None, sar_csv=None, dark_inst_m=5000, dark_pipe_m=2000, quality_dir=None, metrics_dir=None,
+          gold_dir=None, reference=None):
     gaps, outage = None, None
     if coverage is not None:
         from spark.gold_logic import covered_hours
@@ -277,6 +394,10 @@ def build(visits, hourly, manifest, out_dir, fac=None, zones=None, events=None, 
     for row in data["inst"]:
         row[3], row[4], row[5] = pos.get(row[0], (None, None, None))
     data["manifest"] = {k: manifest.get(k) for k in ("run_id", "finished_at", "status", "silver_rows", "tables", "mode")}
+    if coverage is not None:                         # messages per hour over all positions, for the health tab
+        fc = coverage.where(F.col("hour_ts") >= F.lit(t0)).select("hour_ts", "msgs").orderBy("hour_ts").collect()
+        data["fc"] = {"t": [hrs(r["hour_ts"]) for r in fc], "n": [int(r["msgs"] or 0) for r in fc]}
+    data["ph"] = pipeline_health(t0, quality_dir, metrics_dir, gold_dir, reference=reference)
     data["rules"] = rules or {}
     page = PAGE.replace("__DATA__", json.dumps(data, default=_iso, separators=(",", ":")).replace("</", "<\\/"))
     os.makedirs(out_dir, exist_ok=True)
@@ -312,7 +433,20 @@ def build_from_gold(spark, gold, manifest, out_dir, cfg, fac=None):
                  pipelines_csv=os.path.join(gold, "..", "bronze", "reference", "pipelines.csv"),
                  sar_csv=os.path.join(gold, "..", "bronze", "gfw", "sar_detections.csv"),
                  dark_inst_m=cfg.get("surveillance", {}).get("dark_inst_m", 5000),
-                 dark_pipe_m=cfg.get("surveillance", {}).get("dark_pipe_m", 2000))
+                 dark_pipe_m=cfg.get("surveillance", {}).get("dark_pipe_m", 2000),
+                 quality_dir=os.path.join(gold, "..", "quality"), metrics_dir=cfg.get("metrics_dir"), gold_dir=gold,
+                 reference=reference_files(gold, cfg))
+
+
+def reference_files(gold, cfg):
+    """The Bronze reference files and the columns the pipeline reads from each."""
+    from spark.common import facility_columns
+    from spark.gold_pipelines import SEGMENT_COLUMNS
+    ref = os.path.join(gold, "..", "bronze", "reference")
+    return [("Sodir facilities", os.path.join(ref, "facilities.csv"), facility_columns(cfg)),
+            ("Sodir pipelines", os.path.join(ref, "pipelines.csv"), SEGMENT_COLUMNS),
+            ("Fishing-vessel register", os.path.join(ref, "fishing_vessels.csv"), FISHING_COLUMNS),
+            ("Global Fishing Watch radar", os.path.join(gold, "..", "bronze", "gfw", "sar_detections.csv"), SAR_COLUMNS)]
 
 
 def main():
@@ -426,6 +560,7 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
   <button type="button" role="tab" data-tab="safety" aria-selected="false">Safety zones</button>
   <button type="button" role="tab" data-tab="surv" aria-selected="false">Surveillance</button>
   <button type="button" role="tab" data-tab="vessel" aria-selected="false">Vessel</button>
+  <button type="button" role="tab" data-tab="health" aria-selected="false">Pipeline health</button>
 </div>
 <div class="range">
   <div class="range-head">
@@ -542,6 +677,31 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
   <section><h2>Dark vessel detections near infrastructure</h2><p class="note" id="noteDK"></p><div class="scroll" id="tDK"></div><p class="attr" id="attrDK"></p></section>
 </div>
 
+<div data-panel="health" hidden>
+  <section><h2>Pipeline health</h2>
+    <p class="note">How the pipeline itself is doing in the selected days: is data arriving, how much Silver rejects, and whether each hourly Gold run published.</p>
+    <details class="help"><summary>How to read this tab</summary>
+      <ul class="howto">
+        <li><b>Freshness</b> says when each layer last did its work. Anything marked <span class="tag look">Check</span> is older than normal.</li>
+        <li><b>Messages per hour</b> shows the live feed. Orange hours are feed outages: under half the median volume. Events in those hours are flagged, not trusted.</li>
+        <li><b>Bronze columns</b> checks that what arrives still has the expected shape. For live AIS, each Silver batch counts records missing one of the five Bronze columns, new fields in the AIS messages, and expected fields no message carried. For the reference files, it checks the columns the pipeline reads.</li>
+        <li><b>Rejected rows</b> are rows Silver refused, by reason. They are kept in <code>silver/rejects</code> with the raw message. A sudden rise usually means a change at the source.</li>
+        <li><b>Gold runs</b>: a blocked run (the quality gate failed) or a crash leaves the previous Gold published. The log names the failed checks and any warning, such as repeated keys.</li>
+      </ul>
+      <p class="note">Sources: the collector heartbeat, <code>quality/silver_metrics.jsonl</code> (one line per Silver batch), the Gold table <code>feed_coverage_hourly</code> and <code>quality/gold_runs.jsonl</code> (one line per Gold run).</p>
+    </details></section>
+  <section><h2>Freshness</h2><p class="note" id="nFresh"></p><div class="scroll" id="tFresh"></div></section>
+  <section><h2>Bronze columns: live AIS</h2><p class="note" id="nBronze"></p><div class="scroll" id="tBronze"></div></section>
+  <section><h2>Bronze columns: reference files</h2><p class="note">Does each reference file still have every column the pipeline reads? A weekly or daily fetch refuses to replace a file whose source changed its fields, so a problem here also shows as an old update time.</p><div class="scroll" id="tRef"></div></section>
+  <section><h2>Messages per hour</h2><p class="note" id="nFeed"></p><div class="chart"><canvas id="cFeed"></canvas></div></section>
+  <div class="grid">
+    <section><h2>Rejected rows per day</h2><p class="note" id="nRej"></p><div class="chart"><canvas id="cRej"></canvas></div></section>
+    <section><h2>Silver batch times per day</h2><p class="note" id="nSil"></p><div class="chart"><canvas id="cSil"></canvas></div></section>
+  </div>
+  <section><h2>Gold runs</h2><p class="note" id="nRuns"></p><div class="chart"><canvas id="cRuns"></canvas></div></section>
+  <section><h2>Gold run log</h2><p class="note">Newest first. A blocked or crashed run leaves the previous Gold published.</p><div class="scroll" id="tRuns"></div></section>
+</div>
+
 <div data-panel="vessel" hidden>
   <section><h2>Find a vessel</h2><div class="search"><input id="vq" list="vlist" placeholder="Name or MMSI, e.g. ESVAGT AURORA"><datalist id="vlist"></datalist></div>
     <p class="note" id="vnote" style="margin-top:10px"></p></section>
@@ -553,7 +713,7 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
     <section><h2>Visits to installations</h2><div class="scroll" id="vVi"></div></section>
   </div>
 </div>
-<footer>Rebuilt from the Gold tables after each successful hourly publish; this page reloads every 5 minutes while you are not using it.</footer>
+<footer>Rebuilt from the published Gold tables after each hourly Gold run (also after a run the quality gate blocked, so the Pipeline health tab shows it); this page reloads every 5 minutes while you are not using it.</footer>
 </main>
 <script type="application/json" id="data">__DATA__</script>
 <script>
@@ -945,6 +1105,89 @@ $('vq').addEventListener('change', () => {
   vessel = m; render();
 });
 
+// ---------- Pipeline health ----------
+const REASONS = [['parse_failed', 'unreadable message'], ['bad_mmsi', 'invalid MMSI'], ['bad_timestamp', 'invalid time'],
+  ['missing_position', 'no position'], ['sentinel_position', 'position 91/181 (not available)'], ['out_of_range', 'position out of range'],
+  ['future_timestamp', 'time in the future'], ['stale_timestamp', 'time over a year old']];
+const ESSENTIAL = ['mmsi', 'msgtime', 'latitude', 'longitude'], OPTIONAL = ['altitude'];   // altitude: aircraft only
+const ageMin = (ts, ref) => ts ? (ref - Date.parse(ts)) / 6e4 : null;
+function health(){
+  const P = D.ph || {}, SV = P.sv || {t: [], rej: {}}, ALL = P.runs || [], RU = ALL.filter(r => inRange(r.t));
+  const FC = D.fc || {t: [], n: []}, OUT = new Set(D.out || []), built = Date.parse(P.built || new Date().toISOString());
+  const ks = SV.t.map((_, k) => k).filter(k => inRange(SV.t[k]));
+  const sum = a => ks.reduce((s, k) => s + ((a || [])[k] || 0), 0);
+  const input = sum(SV.in), rej = REASONS.reduce((s, [r]) => s + sum(SV.rej[r]), 0);
+  const bad = RU.filter(r => r.s !== 'READY');
+  const bz = ks.map(k => ({t: SV.t[k], cb: (SV.cb || [])[k] || 0, bad: (SV.bad || [])[k] || 0, unk: (SV.unk || [])[k] || {}, abs: (SV.abs || [])[k] || []}))
+    .map(r => Object.assign(r, {issue: r.cb > 0 && (r.bad > 0 || Object.keys(r.unk).length > 0 || r.abs.some(a => !OPTIONAL.includes(a)))}));
+  const refBad = (P.ref || []).filter(r => r.missing.length);
+  kpis('kpis', [[num(RU.length - bad.length) + ' of ' + num(RU.length), 'Gold runs published'], [num(bad.length), 'Gold runs blocked or crashed'],
+    [input ? (100 * rej / input).toFixed(2) + '%' : '–', 'Silver reject rate'], [num(sum(SV.dup)), 'duplicates removed in Silver'],
+    [num((D.out || []).filter(inRange).length), 'feed outage hours'],
+    [num(bz.filter(r => r.issue).length + refBad.length), 'Bronze column issues']]);
+  const checked = bz.filter(r => r.cb > 0);
+  $('nBronze').textContent = checked.length
+    ? 'One row per day, newest first. Field names are the AIS message fields as BarentsWatch sends them. A field absent from one small batch is normal, so absence counts only when no batch of the day had it (altitude only comes from aircraft).'
+    : 'No batch in these days was checked yet: the check starts with this version of the pipeline.';
+  table('tBronze', bz.filter(r => r.cb > 0).reverse(), [['', r => el('span', r.issue ? 'Check' : 'OK', r.issue ? 'tag look' : 'tag')],
+    ['Day', r => dayName(r.t / 24)], ['Batches checked', r => num(r.cb), 1],
+    ['Records missing Bronze columns', r => num(r.bad), 1],
+    ['New fields in messages', r => el('div', Object.entries(r.unk).map(([k, n]) => k + ' (' + num(n) + ' rows)').join(', ') || 'none', 'why')],
+    ['Expected fields absent all day', r => el('div', r.abs.map(a => a + (ESSENTIAL.includes(a) ? ' (essential)' : OPTIONAL.includes(a) ? ' (aircraft only)' : '')).join(', ') || 'none', 'why')]]);
+  table('tRef', P.ref || [], [['File', r => r.file], ['Updated', r => r.updated ? when(r.updated) : 'no file'],
+    ['Columns', r => r.columns == null ? '–' : num(r.columns), 1], ['Columns the pipeline reads', r => num(r.required), 1],
+    ['Missing', r => el('div', r.missing.join(', ') || (r.columns == null ? '–' : 'none'), 'why')],
+    ['', r => r.columns == null ? '–' : el('span', r.missing.length ? 'Check' : 'OK', r.missing.length ? 'tag look' : 'tag')]]);
+
+  const lastRun = ALL.length ? ALL[ALL.length - 1] : null, mf = D.manifest || {};
+  const fresh = [
+    ['Collector', 'last Bronze file written', P.heartbeat, 10],
+    ['Silver', 'last batch processed', P.silver_batch, 15],
+    ['Gold', 'last published', mf.finished_at, 120],
+    ['Gold', 'last run' + (lastRun ? ' (' + lastRun.s.toLowerCase() + ')' : ' (logged from the next deploy)'), lastRun && lastRun.at, 120, lastRun && lastRun.s !== 'READY'],
+  ].map(([layer, what, ts, lim, failed]) => ({layer, what, ts, age: ageMin(ts, built), lim, failed, none: !ts && layer === 'Gold' && !ALL.length}));
+  table('tFresh', fresh, [['Layer', r => r.layer], ['What', r => r.what], ['When', r => r.ts ? when(r.ts) : 'no record'],
+    ['Age', r => r.age == null ? '–' : dur(r.age), 1],
+    ['', r => r.none ? '–' : el('span', r.age == null || r.age > r.lim || r.failed ? 'Check' : 'OK', r.age == null || r.age > r.lim || r.failed ? 'tag look' : 'tag')]]);
+  $('nFresh').textContent = 'As of ' + when(P.built) + ', when this page was built (after each Gold run), so the ages do not grow while you watch. '
+    + (P.disk_free_pct == null ? '' : 'Free disk space: ' + P.disk_free_pct + '%' + (P.disk_free_pct < 15 ? ', below the 15% the monitor alerts on.' : '.'));
+
+  const fi = FC.t.map((_, k) => k).filter(k => inRange(FC.t[k]));
+  const nOut = fi.filter(k => OUT.has(FC.t[k])).length;
+  $('nFeed').textContent = 'All AIS messages per hour that reached Silver. ' + (nOut ? nOut + ' hour' + (nOut === 1 ? ' is' : 's are') + ' marked as feed outage (orange).' : 'No feed outage in these days.');
+  chart('cFeed', {type: 'bar', data: {labels: fi.map(k => at(FC.t[k])), datasets: [{label: 'Messages', data: fi.map(k => FC.n[k]),
+      backgroundColor: fi.map(k => OUT.has(FC.t[k]) ? css('--signal') : css('--accent')), barPercentage: 1, categoryPercentage: 1}]},
+    options: {maintainAspectRatio: false, animation: false, plugins: {legend: {display: false}}, scales: {x: {ticks: {maxTicksLimit: 12}, grid: {display: false}}, y: {beginAtZero: true}}}});
+
+  const dl = ks.map(k => dayName(SV.t[k] / 24));
+  const pal = [css('--warn'), css('--signal'), css('--onshore'), css('--accent'), css('--muted'), css('--ink'), css('--line')];
+  const used = REASONS.map((r, j) => [r, j]).filter(([[r]]) => sum(SV.rej[r]) > 0);
+  $('nRej').textContent = num(rej) + ' of ' + num(input) + ' rows rejected in these days' + (used.length ? '; rejected rows are kept with the raw message in silver/rejects.' : '.');
+  chart('cRej', {type: 'bar', data: {labels: dl, datasets: used.map(([[r, l], j]) => ({label: l, data: ks.map(k => SV.rej[r][k]), backgroundColor: pal[j]}))},
+    options: {maintainAspectRatio: false, animation: false, plugins: {legend: {position: 'bottom'}},
+              scales: {x: {stacked: true, ticks: {maxTicksLimit: 10}, grid: {display: false}}, y: {stacked: true, beginAtZero: true, ticks: {precision: 0}}}}});
+  const old = ks.filter(k => SV.p95[k] > 86400);
+  $('nSil').textContent = 'Average and slowest batch runtime, and the typical live batch\'s 95th-percentile message age when stored (seconds; historic backfill batches left out).'
+    + (old.length ? ' Very old messages (some batch\'s p95 over a day): ' + old.map(k => dayName(SV.t[k] / 24) + ' (' + dur(SV.p95[k] / 60) + ')').join(', ') + '.' : '');
+  chart('cSil', {type: 'line', data: {labels: dl, datasets: [
+      {label: 'Average batch (s)', data: ks.map(k => SV.rt[k]), borderColor: css('--accent'), backgroundColor: css('--accent'), pointRadius: 2},
+      {label: 'Slowest batch (s)', data: ks.map(k => SV.rtx[k]), borderColor: css('--signal'), backgroundColor: css('--signal'), pointRadius: 2},
+      {label: 'Message age p95, typical batch (s)', data: ks.map(k => (SV.p95m || SV.p95)[k]), borderColor: css('--onshore'), backgroundColor: css('--onshore'), pointRadius: 2}]},
+    options: {maintainAspectRatio: false, animation: false, plugins: {legend: {position: 'bottom'}}, scales: {x: {ticks: {maxTicksLimit: 10}, grid: {display: false}}, y: {beginAtZero: true}}}});
+
+  $('nRuns').textContent = RU.length ? 'Runtime of each run in seconds. Teal: published; orange: full rebuild; red: blocked by the gate or crashed.'
+    : 'No Gold runs logged in these days. The run log starts with this version of the pipeline.';
+  const short = s => new Date(s).toLocaleString('en-GB', {day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'UTC'});
+  chart('cRuns', {type: 'bar', data: {labels: RU.map(r => short(r.at)), datasets: [{label: 'Runtime (s)', data: RU.map(r => r.rt),
+      backgroundColor: RU.map(r => r.s !== 'READY' ? css('--warn') : r.m === 'full' ? css('--signal') : css('--accent'))}]},
+    options: {maintainAspectRatio: false, animation: false, plugins: {legend: {display: false}}, scales: {x: {ticks: {maxTicksLimit: 12}, grid: {display: false}}, y: {beginAtZero: true}}}});
+  table('tRuns', RU.slice().reverse(), [['Finished (UTC)', r => short(r.at)],
+    ['Status', r => el('span', r.s === 'READY' ? 'published' : r.s === 'FAILED' ? 'blocked by gate' : 'crashed', r.s === 'READY' ? 'tag' : 'tag look')],
+    ['Mode', r => r.m || '–'], ['Runtime', r => r.rt == null ? '–' : r.rt < 120 ? Math.round(r.rt) + ' s' : (r.rt / 60).toFixed(1) + ' min', 1], ['Silver rows', r => num(r.rows), 1],
+    ['Repeated keys', r => r.k == null ? '–' : num(r.k), 1],
+    ['Failed checks and warnings', r => el('div', [...(r.f || []).map(c => 'failed: ' + c), ...(r.w || [])].join('; ') || '–', 'why')]]);
+}
+
 // ---------- shared ----------
 function status(){
   const mf = D.manifest || {}, s = $('status'), hours = (Date.now() - Date.parse(mf.finished_at)) / HOUR;
@@ -953,13 +1196,13 @@ function status(){
 }
 function render(){
   if (typeof Chart !== 'undefined') { Chart.defaults.color = css('--muted'); Chart.defaults.font.family = css('--font'); Chart.defaults.borderColor = css('--line'); }
-  ({traffic, safety, surv: surveillance, vessel: vesselPanel})[tab]();
+  ({traffic, safety, surv: surveillance, vessel: vesselPanel, health})[tab]();
 }
 function setTab(t){
   tab = t;
   document.querySelectorAll('.tabs button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.tab === t)));
   document.querySelectorAll('[data-panel]').forEach(p => p.hidden = p.dataset.panel !== t);
-  $('grpSeg').hidden = t === 'vessel';
+  $('grpSeg').hidden = t === 'vessel' || t === 'health';
   try { history.replaceState(null, '', '#' + t + (t === 'vessel' && vessel != null ? '=' + vessel : '')); } catch (e) {}
   render();
 }
@@ -987,7 +1230,7 @@ setInterval(() => { if (Date.now() - lastTouch > 120000) location.reload(); }, 3
 const h = (location.hash || '').slice(1).split('=');
 if (h[0] === 'vessel' && h[1] && VES[h[1]]) vessel = +h[1];
 status(); syncRange();
-setTab(['traffic', 'safety', 'surv', 'vessel'].includes(h[0]) ? h[0] : 'traffic');
+setTab(['traffic', 'safety', 'surv', 'vessel', 'health'].includes(h[0]) ? h[0] : 'traffic');
 })();
 </script>
 </body>

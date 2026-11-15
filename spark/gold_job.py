@@ -107,6 +107,35 @@ def kept_published(spark, path, ts_col, open_visits, v_day, s_day):
                .where(F.col("open_from").isNull() | (F.col(ts_col) < F.col("open_from"))).drop("open_from"))
 
 
+def log_run(P, manifest):
+    """Appends one line per Gold run (published or blocked) to quality/gold_runs.jsonl: the history behind the
+    dashboard's Pipeline health tab. _READY.json and _LAST_FAILED.json only keep the latest run."""
+    try:
+        failed = [c["check"] for c in manifest.get("checks", []) if not c["passed"]]
+        rk = (manifest.get("keys") or {}).get("repeated_keys") or {}
+        line = {k: manifest.get(k) for k in ("run_id", "started_at", "finished_at", "runtime_s", "status", "mode",
+                                              "recompute_from", "silver_rows")}
+        line.update(checks=len(manifest.get("checks", [])), failed=failed, warnings=manifest.get("warnings", []),
+                    repeated_keys=sum(rk.values()), duplicates_removed=manifest.get("duplicates_removed"))
+        os.makedirs(P("quality"), exist_ok=True)
+        with open(P("quality/gold_runs.jsonl"), "a") as f:
+            f.write(json.dumps(line) + "\n")
+    except Exception as e:                       # the run log must never fail Gold
+        print(f"run log not written: {e!r}")
+
+
+def build_dashboard(spark, cfg, P, manifest):
+    """Rebuilds the dashboard page from the PUBLISHED Gold; never fails Gold."""
+    try:
+        from spark import dashboard
+        from spark.common import load_facilities
+        with obs.span("gold.dashboard"):
+            fac = load_facilities(spark, dict(cfg, facility_filter=None), P("bronze/reference/facilities.csv"))
+            dashboard.build_from_gold(spark, P("gold"), manifest, P("gold/dashboard"), cfg, fac=fac)
+    except Exception as e:
+        print(f"dashboard not updated: {e!r}")
+
+
 def main(full=False):
     cfg = pipeline_config.load()
     cfg["lookback_days"] = int(os.environ.get("GOLD_LOOKBACK_DAYS", cfg["lookback_days"]))
@@ -322,7 +351,7 @@ def main(full=False):
     ok = all(c["passed"] for c in checks)
 
     manifest_keys = {"check_from": str(check_from), "repeated_keys": dups}
-    manifest = {"run_id": run_id, "env": cfg["env"], "mode": "full" if full else "incremental",
+    manifest = {"run_id": run_id, "env": cfg["env"], "started_at": started.isoformat(), "mode": "full" if full else "incremental",
                 "recompute_from": str(s_day), "visits_from": str(v_day), "newest_day": str(max_dt),
                 "silver_rows": n_s, "silver_rows_before_dedupe": raw_n,
                 "duplicates_removed": (raw_n - n_s) if raw_n is not None else None,
@@ -342,8 +371,13 @@ def main(full=False):
     os.makedirs(P("gold"), exist_ok=True)
     if not ok:
         obs.mark_error("quality gate failed")
-        manifest["status"] = "FAILED"; manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+        fin = datetime.now(timezone.utc)
+        manifest.update(status="FAILED", finished_at=fin.isoformat(), runtime_s=round((fin - started).total_seconds(), 1))
         json.dump(manifest, open(P("gold/_LAST_FAILED.json"), "w"), indent=2)
+        log_run(P, manifest)
+        published = plan.read_json(P("gold/_READY.json"))
+        if published:          # the page keeps showing the published Gold, and its health tab shows this failure
+            build_dashboard(spark, cfg, P, published)
         print(json.dumps(manifest, indent=2)); sys.exit("Gold NOT published: quality checks failed")
 
     # ---- publish: staged days swapped in one partition at a time; dimensions rebuilt and swapped -----------
@@ -376,8 +410,10 @@ def main(full=False):
 
     tables = {t: (read_table(spark, P(f"gold/{t}")).count() if plan.has_data(P(f"gold/{t}")) else 0)
               for t in PARTITIONED + DIMENSIONS}
-    manifest.update(status="READY", tables=tables, finished_at=datetime.now(timezone.utc).isoformat())
+    fin = datetime.now(timezone.utc)
+    manifest.update(status="READY", tables=tables, finished_at=fin.isoformat(), runtime_s=round((fin - started).total_seconds(), 1))
     json.dump(manifest, open(P("gold/_READY.json"), "w"), indent=2)
+    log_run(P, manifest)
     json.dump({"last_success_epoch": started.timestamp(), "last_success_at": started.isoformat(), "run_id": run_id,
                "layout": LAYOUT, "installation_names": names_hash},
               open(P("gold/_state.json"), "w"), indent=2)
@@ -388,23 +424,26 @@ def main(full=False):
             gold_pipelines.run(spark, cfg, P)
     except Exception as e:
         print(f"pipeline loitering not updated: {e!r}")
-    try:                                            # the dashboard must never fail Gold
-        from spark import dashboard
-        from spark.common import load_facilities
-        with obs.span("gold.dashboard"):
-            fac = load_facilities(spark, dict(cfg, facility_filter=None), P("bronze/reference/facilities.csv"))
-            dashboard.build_from_gold(spark, P("gold"), manifest, P("gold/dashboard"), cfg, fac=fac)
-    except Exception as e:
-        print(f"dashboard not updated: {e!r}")
+    build_dashboard(spark, cfg, P, manifest)
 
 
 def traced_main():
     ap = argparse.ArgumentParser(description="Build and publish Gold")
     ap.add_argument("--full", action="store_true", help="rebuild the whole lookback window instead of changed days")
     a = ap.parse_args()
-    obs.init("ais-gold", pipeline_config.load()["env"])
-    with obs.span("gold.run"):
-        main(full=a.full)
+    cfg = pipeline_config.load()
+    obs.init("ais-gold", cfg["env"])
+    started = datetime.now(timezone.utc)
+    try:
+        with obs.span("gold.run"):
+            main(full=a.full)
+    except Exception as e:      # a crash (e.g. out of memory) is logged as a run too; a blocked gate exits via SystemExit
+        fin = datetime.now(timezone.utc)
+        log_run(lambda rel: pipeline_config.path(cfg, rel),
+                {"started_at": started.isoformat(), "finished_at": fin.isoformat(), "status": "ERROR",
+                 "runtime_s": round((fin - started).total_seconds(), 1), "mode": "full" if a.full else None,
+                 "warnings": [f"Gold crashed: {e!r}"[:400]]})
+        raise
 
 
 if __name__ == "__main__":

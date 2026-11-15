@@ -25,8 +25,28 @@ BRONZE_SCHEMA = T.StructType([T.StructField(n, T.StringType()) for n in
                               ["_source", "_ingest_ts", "_run_id", "_file", "payload"]])
 KNOWN_UNUSED_FIELDS = ["dimensionA", "dimensionB", "dimensionC", "dimensionD", "draught", "eta",
                        "msgtimeStatic", "positionFixingDeviceType", "reportClass", "stream"]
+ESSENTIAL_FIELDS = ["mmsi", "msgtime", "latitude", "longitude"]          # without these a message is useless
+
+
+def bronze_columns(bronze: DataFrame) -> dict:
+    """Bronze column check for one batch (two small actions): records missing any of the five Bronze columns
+    (the collector's record contract), payload fields that are not in PAYLOAD_SCHEMA or KNOWN_UNUSED_FIELDS (new
+    fields, with row counts), and schema fields that no message in the batch carried. A field can be legitimately
+    absent from a small batch (altitude: aircraft only), so the health tab flags absence only for a whole day,
+    and immediately only for ESSENTIAL_FIELDS."""
+    contract = sum(F.col(f.name).isNull().cast("int") for f in BRONZE_SCHEMA.fields)
+    bad = bronze.agg(F.sum((contract > 0).cast("int"))).collect()[0][0] or 0
+    keys = (bronze.select(F.explode(F.map_keys(F.from_json("payload", "map<string,string>"))).alias("k"))
+                  .groupBy("k").count().collect())
+    seen = {r["k"]: r["count"] for r in keys}
+    expected = [f.name for f in PAYLOAD_SCHEMA.fields]
+    return {"bronze_contract_bad_rows": int(bad),
+            "unknown_keys": {k: n for k, n in sorted(seen.items()) if k not in expected and k not in KNOWN_UNUSED_FIELDS},
+            "absent_keys": [k for k in expected if k not in seen]}
+
+
 REJECT_REASONS = ["parse_failed", "bad_mmsi", "bad_timestamp", "missing_position",
-                  "sentinel_position", "out_of_range", "future_timestamp"]
+                  "sentinel_position", "out_of_range", "future_timestamp", "stale_timestamp"]
 
 
 def parse(bronze: DataFrame) -> DataFrame:
@@ -66,8 +86,10 @@ def standardize(p: DataFrame, max_ship_kn: float = 50.0) -> DataFrame:
              .withColumn("name", F.when(F.trim("name") == "", None).otherwise(F.upper(F.trim("name")))))
 
 
-def validate(s: DataFrame) -> DataFrame:
-    """Adds reject_reason (first failing rule; null = accepted). Rejected rows are kept separately, not corrected."""
+def validate(s: DataFrame, max_event_age_days: float = 365) -> DataFrame:
+    """Adds reject_reason (first failing rule; null = accepted). Rejected rows are kept separately, not corrected.
+    stale_timestamp: stamped more than max_event_age_days before it was ingested, e.g. a transponder reporting a default
+    clock date (2013 was seen in production). The historic backfill is weeks old, well inside the limit."""
     lat, lon = F.col("latitude"), F.col("longitude")
     reason = (F.when(F.col("parse_failed"), "parse_failed")
                .when(F.col("mmsi").isNull() | (F.col("mmsi") < 100000000) | (F.col("mmsi") > 999999999), "bad_mmsi")
@@ -75,7 +97,8 @@ def validate(s: DataFrame) -> DataFrame:
                .when(lat.isNull() | lon.isNull(), "missing_position")
                .when((lat == 91) | (lon == 181), "sentinel_position")
                .when(~lat.between(-90, 90) | ~lon.between(-180, 180), "out_of_range")
-               .when(F.col("ingest_ts").isNotNull() & (F.col("latency_s") < -300), "future_timestamp"))
+               .when(F.col("ingest_ts").isNotNull() & (F.col("latency_s") < -300), "future_timestamp")
+               .when(F.col("ingest_ts").isNotNull() & (F.col("latency_s") > max_event_age_days * 86400), "stale_timestamp"))
     return s.withColumn("reject_reason", reason)
 
 
