@@ -10,12 +10,16 @@ scripts/demo_gate_failure.sh   # shows Gold refusing to publish bad data
 PYTHONPATH=. pytest -q         # unit tests
 ```
 ## Run it for real (always-on host)
-1. Register at barentswatch.no → My page → create API client (scope `ais`); `cp .env.example .env` and fill it in (`APP_ENV=prod`).
-2. `python reference/load_sodir.py` (installations → `data/<env>/bronze/reference/facilities.csv`; the loader writes both facilities.csv and fields.csv; check printed column names against `facility_name_col`/`facility_kind_col` in `config/*.json`).
-3. Start services: `deploy-ais-collector.service` (collector) and `deploy-ais-pipeline-loop.service` (Silver every 120 s, Gold hourly), installed under systemd as `ais-collector` and `ais-pipeline-loop`.
-4. After the first files: `python scripts/infer_schema.py` and confirm `PAYLOAD_SCHEMA` in `spark/silver_logic.py`.
-5. After 24 h: `python scripts/hourly_report.py 5` (files, messages, bytes per hour, message rate, days to 5 GB). Backfill: order a box at hais.kystverket.no, check it with `scripts/probe_historic.py`.
-6. Operate: `python scripts/status_report.py`.
+Any Linux host with systemd, Java 17+ and Python 3.11; nothing below is tied to a user name or folder.
+1. Clone the repository, then create the Python environment: `python3 -m venv ~/spark-env && ~/spark-env/bin/pip install -r requirements.txt`.
+2. Register at barentswatch.no → My page → create API client (scope `ais`); `cp .env.example .env` and fill it in (`APP_ENV=prod`; `GFW_TOKEN` optional).
+3. Reference data: `APP_ENV=prod PYTHONPATH=. ~/spark-env/bin/python reference/fetch_sodir.py` (then `fetch_pipelines.py`, `fetch_fishing_vessels.py`, `fetch_gfw_sar.py`); the timers refresh them afterwards.
+4. Tracing: `scripts/install_jaeger.sh` (Jaeger v2.22.0 with `config/jaeger.yaml`, localhost only).
+5. Services: `scripts/install_services.sh` renders every `deploy-*.service` / `deploy-*.timer` template for this machine (user, repo, `VENV`, `JAVA_HOME`, `JAEGER_DIR`; override any as environment variables), installs them under systemd and starts them: `ais-collector`, `ais-pipeline-loop`, `ais-dashboard`, `jaeger` and the four timers.
+6. CI deploy and monitor: register a GitHub self-hosted runner on the host; if production is not in `/home/ubuntu/AIS-Data-Pipeline-Project` with `/home/ubuntu/spark-env`, set the repository variables `PROD_DIR` and `PROD_VENV`.
+7. After the first files: `python scripts/infer_schema.py` and confirm `PAYLOAD_SCHEMA` in `spark/silver_logic.py`.
+8. After 24 h: `python scripts/hourly_report.py 5` (files, messages, bytes per hour, message rate, days to 5 GB). Backfill: order a box at hais.kystverket.no, check it with `scripts/probe_historic.py`.
+9. Operate: `python scripts/status_report.py`.
 
 ## Operations runbook (production host)
 All commands from `~/AIS-Data-Pipeline-Project`. `PY=/home/ubuntu/spark-env/bin/python`. Give prod settings to single commands
@@ -33,7 +37,7 @@ All commands from `~/AIS-Data-Pipeline-Project`. `PY=/home/ubuntu/spark-env/bin/
 | `ais-dashboard` | Serves the Gold dashboard on localhost:8050 | `journalctl -u ais-dashboard` |
 | `jaeger` | Trace store and UI (localhost:4318 in, localhost:16686 UI) | `journalctl -u jaeger` |
 
-Install the last three once with `scripts/install_ops_services.sh` (it copies the command Jaeger runs with now).
+All of them are installed by `scripts/install_services.sh` (after `scripts/install_jaeger.sh`); rerun it after changing a `deploy-*` file.
 Preview retention first: `APP_ENV=prod $PY scripts/bronze_retention.py` (dry run: prints how many files and GB would go).
 
 `sudo systemctl status|restart ais-collector ais-pipeline-loop` · `systemctl list-timers sodir-refresh.timer` · health: `APP_ENV=prod $PY scripts/status_report.py`.

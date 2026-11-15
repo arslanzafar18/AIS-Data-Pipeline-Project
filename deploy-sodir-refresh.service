@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=ubuntu
-WorkingDirectory=/home/ubuntu/AIS-Data-Pipeline-Project
-EnvironmentFile=/home/ubuntu/AIS-Data-Pipeline-Project/.env
-Environment=PYTHONPATH=/home/ubuntu/AIS-Data-Pipeline-Project
-ExecStart=/home/ubuntu/spark-env/bin/python reference/fetch_sodir.py
-ExecStart=/home/ubuntu/spark-env/bin/python reference/fetch_pipelines.py
+User=@USER@
+WorkingDirectory=@REPO@
+EnvironmentFile=@REPO@/.env
+Environment=PYTHONPATH=@REPO@
+ExecStart=@VENV@/bin/python reference/fetch_sodir.py
+ExecStart=@VENV@/bin/python reference/fetch_pipelines.py

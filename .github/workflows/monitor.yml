@@ -16,19 +16,22 @@ permissions:
 jobs:
   health:
     runs-on: self-hosted        # reads the heartbeat and Gold manifest on the always-on host
+    env:                        # where production lives on that host: repository variables, with this VM's paths as default
+      PROD_DIR: ${{ vars.PROD_DIR || '/home/ubuntu/AIS-Data-Pipeline-Project' }}
+      PROD_VENV: ${{ vars.PROD_VENV || '/home/ubuntu/spark-env' }}
     steps:
       - name: Collector heartbeat, Gold readiness, disk space, message volume
         shell: bash             # -eo pipefail: the step fails if the check fails, even through tee
         env:
-          HEARTBEAT_URL: file:///home/ubuntu/AIS-Data-Pipeline-Project/metrics/prod/heartbeat.json
-          GOLD_URL: file:///home/ubuntu/AIS-Data-Pipeline-Project/data/prod/gold/_READY.json
+          HEARTBEAT_URL: file://${{ env.PROD_DIR }}/metrics/prod/heartbeat.json
+          GOLD_URL: file://${{ env.PROD_DIR }}/data/prod/gold/_READY.json
           MAX_AGE_SECONDS: ${{ inputs.test_failure && '1' || '600' }}
-          DATA_DIR: /home/ubuntu/AIS-Data-Pipeline-Project/data/prod
+          DATA_DIR: ${{ env.PROD_DIR }}/data/prod
           MIN_FREE_PCT: "15"                         # alert when the data disk has less than 15% free
-          EVENTS_PATH: /home/ubuntu/AIS-Data-Pipeline-Project/metrics/prod/events.jsonl
+          EVENTS_PATH: ${{ env.PROD_DIR }}/metrics/prod/events.jsonl
           VOLUME_MIN_FRACTION: "0.5"                 # alert when the last hour has under half the usual messages
         run: |
-          /home/ubuntu/spark-env/bin/python /home/ubuntu/AIS-Data-Pipeline-Project/scripts/check_heartbeat.py 2>&1 \
+          "$PROD_VENV/bin/python" "$PROD_DIR/scripts/check_heartbeat.py" 2>&1 \
             | tee "$RUNNER_TEMP/check.txt"
 
       # A failed scheduled run only emails one person, so the alert goes to an issue the whole team sees.

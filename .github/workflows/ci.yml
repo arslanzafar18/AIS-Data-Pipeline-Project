@@ -33,10 +33,13 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: self-hosted
+    env:                        # where production lives on that host: repository variables, with this VM's paths as default
+      PROD_DIR: ${{ vars.PROD_DIR || '/home/ubuntu/AIS-Data-Pipeline-Project' }}
+      PROD_VENV: ${{ vars.PROD_VENV || '/home/ubuntu/spark-env' }}
     steps:
       - name: Deploy on the always-on host (prod config)
         run: |
-          cd ~/AIS-Data-Pipeline-Project
+          cd "$PROD_DIR"
           git pull --ff-only
-          ~/spark-env/bin/pip install -r requirements.txt
+          "$PROD_VENV/bin/pip" install -r requirements.txt
           sudo systemctl restart ais-collector ais-pipeline-loop
