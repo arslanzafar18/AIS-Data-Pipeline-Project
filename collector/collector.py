@@ -28,6 +28,9 @@ BRONZE_DIR = Path(pipeline_config.path(CFG, "bronze/raw"))
 METRICS_DIR = Path(CFG["metrics_dir"])
 FLUSH_SECONDS = int(CFG["flush_seconds"])
 
+MAX_BACKOFF_SECONDS = 60        # a live stream is not replayed: every second disconnected is data lost
+AUTH_RETRY_SECONDS = 600        # rejected credentials: retrying faster cannot help, a person must fix .env
+
 RUN_ID = uuid.uuid4().hex[:12]
 lock = threading.Lock()
 buffer: list = []          # (ingest_ts_iso, raw_line)
@@ -63,6 +66,23 @@ def connect(attempt):
         return resp, expiry
 
 
+def is_auth_failure(error):
+    """True if the token server or the stream refused our credentials: HTTP 401 or 403, or 400 from the token
+    server (OAuth2 servers answer a wrong client secret with 400 invalid_client)."""
+    resp = getattr(error, "response", None)
+    status = getattr(resp, "status_code", None)
+    return status in (401, 403) or (status == 400 and str(getattr(resp, "url", "")).startswith(TOKEN_URL))
+
+
+def retry_wait(error, backoff):
+    """(seconds to wait now, backoff for the next failure). Any failure doubles the wait, 1, 2, 4 ... up to
+    MAX_BACKOFF_SECONDS; rejected credentials wait AUTH_RETRY_SECONDS instead, because only a person can fix
+    them (the monitor alerts after 10 minutes without a new Bronze file)."""
+    if is_auth_failure(error):
+        return AUTH_RETRY_SECONDS, backoff
+    return backoff, min(backoff * 2, MAX_BACKOFF_SECONDS)
+
+
 def reader():
     """Connect, read lines, reconnect with backoff; refresh token before expiry."""
     backoff, attempt = 1, 0
@@ -88,11 +108,12 @@ def reader():
                           duration_s=round(time.time() - started, 1), attempt=attempt):
                 pass
         except Exception as e:
-            log_event("reader_error", error=repr(e), backoff=backoff)
-            with obs.span("bronze.reader_error", error=repr(e)[:300], backoff_s=backoff, attempt=attempt):
+            wait, backoff = retry_wait(e, backoff)
+            auth = is_auth_failure(e)
+            log_event("reader_error", error=repr(e), backoff=wait, auth_failure=auth)
+            with obs.span("bronze.reader_error", error=repr(e)[:300], backoff_s=wait, attempt=attempt, auth_failure=auth):
                 obs.mark_error(type(e).__name__)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            stop.wait(wait)             # unlike time.sleep, a shutdown does not have to wait out a long pause
 
 
 def make_record(ingest_ts, line, file_name, run_id=None):
