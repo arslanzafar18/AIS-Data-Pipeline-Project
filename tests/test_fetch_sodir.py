@@ -70,3 +70,19 @@ def test_text_is_trimmed_so_names_still_match():
               "geometry": OSEBERG["geometry"]}
     r = fs.to_rows([padded], "s", "t")[0]
     assert (r["facName"], r["facKind"]) == ("CASTORO 10", "VESSEL")
+
+
+@pytest.mark.parametrize("code, calls", [(400, 1), (404, 1), (429, 4), (503, 4)])
+def test_rejected_requests_are_not_retried(monkeypatch, code, calls):
+    import urllib.error
+    seen, waits = [], []
+
+    def refuse(req, timeout=None):
+        seen.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, code, "refused", {}, None)
+
+    monkeypatch.setattr(fs.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(fs.time, "sleep", waits.append)
+    with pytest.raises(urllib.error.HTTPError):
+        fs._json("https://example.invalid/layer")
+    assert len(seen) == calls and waits == [5, 10, 20][:calls - 1]

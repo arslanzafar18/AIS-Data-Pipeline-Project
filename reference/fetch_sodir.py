@@ -15,7 +15,7 @@ Stdlib only.   Run:  APP_ENV=prod PYTHONPATH=. python reference/fetch_sodir.py
 import sys
 from pathlib import Path as _P
 sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
-import csv, json, math, os, time, urllib.parse, urllib.request
+import csv, json, math, os, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -57,6 +57,10 @@ def _json(url, tries=4):
             if "error" in d:
                 raise RuntimeError(f"API error: {d['error']}")
             return d
+        except urllib.error.HTTPError as e:
+            if (400 <= e.code < 500 and e.code != 429) or k == tries - 1:   # a rejected request does not get better
+                raise
+            time.sleep(5 * 2 ** k)                                       # 429 or a server error: back off
         except Exception:
             if k == tries - 1:
                 raise
