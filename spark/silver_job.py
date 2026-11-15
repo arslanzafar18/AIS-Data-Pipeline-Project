@@ -33,9 +33,13 @@ def main(src="bronze/raw", ckpt="_checkpoints/silver", max_files=None):
 
     def _process(df, batch_id):
         t0 = time.time()
-        flagged = L.validate(L.standardize(L.parse(df), cfg.get("max_ship_kn", 50.0))).cache()
+        df = df.cache()
+        with obs.span("silver.bronze_columns"):
+            cols = L.bronze_columns(df)                              # Bronze contract and payload fields as expected?
+        flagged = L.validate(L.standardize(L.parse(df), cfg.get("max_ship_kn", 50.0)), cfg.get("max_event_age_days", 365)).cache()
         with obs.span("silver.quality_agg"):
             q = L.quality_agg(flagged)                               # BEFORE-processing quality (one action)
+        q.update(cols)
         with obs.span("silver.lineage"):
             files = sorted(r[0] for r in flagged.select("_file").distinct().collect() if r[0])
         obs.annotate(**{"bronze.file_count": len(files), "bronze.first_file": files[0] if files else "",
@@ -75,7 +79,7 @@ def main(src="bronze/raw", ckpt="_checkpoints/silver", max_files=None):
             f.write(json.dumps(q) + "\n")
         print(json.dumps(q))
         obs.annotate(**{f"q.{k}": v for k, v in q.items()})
-        for x in (flagged, d, out):
+        for x in (flagged, d, out, df):
             x.unpersist()
 
     (spark.readStream.schema(L.BRONZE_SCHEMA)

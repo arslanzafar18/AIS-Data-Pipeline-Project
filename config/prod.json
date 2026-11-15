@@ -37,6 +37,7 @@
   },
   "stationary_kn": 0.5,
   "visit_gap_s": 1800,
+  "max_event_age_days": 365,
   "cross_batch_dedupe": true,
   "max_files_per_trigger": 200,
   "lookback_days": 90,

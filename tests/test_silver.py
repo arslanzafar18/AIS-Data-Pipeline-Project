@@ -28,7 +28,8 @@ def test_sentinels_corrected_not_rejected(spark):
 def test_reject_reasons(spark):
     cases = {"parse_failed": '{"mmsi": 2571', "bad_mmsi": good(mmsi=12345), "bad_timestamp": good(msgtime="garbage"),
              "missing_position": good(latitude=None), "sentinel_position": good(latitude=91, longitude=181),
-             "out_of_range": good(latitude=120.0), "future_timestamp": good(msgtime="2026-10-11T11:00:00+00:00")}
+             "out_of_range": good(latitude=120.0), "future_timestamp": good(msgtime="2026-10-11T11:00:00+00:00"),
+             "stale_timestamp": good(msgtime="2013-12-31T23:59:59+00:00")}
     for want, payload in cases.items():
         assert run(spark, [payload])[0]["reject_reason"] == want, want
 
