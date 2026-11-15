@@ -13,7 +13,8 @@ View it:   python3 -m http.server 8050 --bind 127.0.0.1 --directory <data_root>/
 Preview from any Gold folder (read-only on the tables; writes ./dashboard-preview unless --out is given):
            PYTHONPATH=. python -m spark.dashboard --gold-dir data/prod/gold [--out folder]
 """
-import argparse, json, os
+import argparse, json, math, os
+from datetime import datetime
 from pyspark.sql import functions as F
 
 BUCKETS = [(15, "Under 15 min"), (60, "15 to 60 min"), (180, "1 to 3 h"), (720, "3 to 12 h"),
@@ -89,8 +90,76 @@ def load_fishing_call_signs(path):
         return {norm_call_sign(r.get("call_sign")) for r in csv.DictReader(f)} - {""}
 
 
+def pipeline_lines(path, phases=("IN SERVICE",)):
+    """Sodir pipeline segments (bronze/reference/pipelines.csv) -> map polylines and the segment list.
+    Consecutive segments that join end to start form one line; a jump starts a new one."""
+    import csv
+    if not path or not os.path.exists(path):
+        return [], []
+    with open(path, newline="", encoding="utf-8") as f:
+        segs = [r for r in csv.DictReader(f) if not phases or r.get("phase") in phases]
+    segs.sort(key=lambda r: (r["pipeline_id"], int(r["seg_no"])))
+    lines, cur, key = [], None, None
+    out = []
+    for r in segs:
+        a, b = (float(r["lat1"]), float(r["lon1"])), (float(r["lat2"]), float(r["lon2"]))
+        out.append((r["name"] or r["label"], r.get("medium") or "", a[0], a[1], b[0], b[1]))
+        if cur is None or key != r["pipeline_id"] or cur[2][-1] != [round(a[0], 4), round(a[1], 4)]:
+            cur = [r["name"] or r["label"], r.get("medium") or "", [[round(a[0], 4), round(a[1], 4)]]]
+            lines.append(cur)
+            key = r["pipeline_id"]
+        cur[2].append([round(b[0], 4), round(b[1], 4)])
+    return lines, out
+
+
+def dark_near_infrastructure(detections, installations, segments, inst_m, pipe_m, cell=0.1):
+    """Radar detections within inst_m of an offshore installation or pipe_m of a pipeline, each with the nearest of
+    both. A grid of `cell` degrees keeps the number of distance checks small."""
+    import math
+    from spark.gold_pipelines import point_segment_m_py
+
+    def hav(a1, o1, a2, o2):
+        p1, p2 = math.radians(a1), math.radians(a2)
+        h = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(o2 - o1) / 2) ** 2
+        return 2 * 6371000.0 * math.asin(math.sqrt(h))
+
+    grid = {}
+    reach = max(inst_m, pipe_m) / 111320.0 + cell
+    def add(kind, item, la0, lo0, la1, lo1):
+        for gy in range(math.floor((la0 - reach) / cell), math.floor((la1 + reach) / cell) + 1):
+            for gx in range(math.floor((lo0 - 2 * reach) / cell), math.floor((lo1 + 2 * reach) / cell) + 1):
+                grid.setdefault((gy, gx), ([], []))[kind].append(item)
+    for it in installations:
+        add(0, it, it[1], it[2], it[1], it[2])
+    for sg in segments:
+        add(1, sg, min(sg[2], sg[4]), min(sg[3], sg[5]), max(sg[2], sg[4]), max(sg[3], sg[5]))
+    out = []
+    for d in detections:
+        lat, lon = d["lat"], d["lon"]
+        insts, segs = grid.get((math.floor(lat / cell), math.floor(lon / cell)), ([], []))
+        bi = min(((hav(lat, lon, i[1], i[2]), i[0]) for i in insts), default=(None, None))
+        bp = min(((point_segment_m_py(lat, lon, s_[2], s_[3], s_[4], s_[5]), s_[0]) for s_ in segs), default=(None, None))
+        near_i = bi[0] is not None and bi[0] <= inst_m
+        near_p = bp[0] is not None and bp[0] <= pipe_m
+        if near_i or near_p:
+            out.append({**d, "inst": bi[1] if near_i else None, "inst_m": round(bi[0]) if near_i else None,
+                        "pipe": bp[1] if near_p else None, "pipe_m": round(bp[0]) if near_p else None})
+    return out
+
+
+def read_sar(path):
+    import csv
+    if not path or not os.path.exists(path):
+        return None, None
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    dets = [{"date": r["date"], "lat": float(r["lat"]), "lon": float(r["lon"]), "n": int(r["detections"] or 0)} for r in rows]
+    meta = {"versions": sorted({r["dataset"] for r in rows}), "accessed": max((r["fetched_at"] for r in rows), default=None)}
+    return dets, meta
+
+
 def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=None, gaps=None, outage_hours=None,
-              fishing_call_signs=None):
+              fishing_call_signs=None, extra_mmsi=None):
     """Compact, column-wise data: one entry per visit, zone entry, event and hour, so the browser can recompute
     every number for any date range. Times are whole hours since t0 (midnight of the first day)."""
     end = hourly.agg(F.max("hour_ts")).collect()[0][0]
@@ -122,7 +191,7 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=No
     firsts = [r["arrival_ts"] for r in vr] + ([hr[0]["hour_ts"]] if hr else [])
     t0 = min(firsts).replace(hour=0, minute=0, second=0, microsecond=0)
     hrs = lambda ts: int((ts - t0).total_seconds() // 3600)
-    seen = {r["mmsi"] for r in vr} | {r["mmsi"] for r in zr} | {r["mmsi"] for r in er}
+    seen = {r["mmsi"] for r in vr} | {r["mmsi"] for r in zr} | {r["mmsi"] for r in er} | set(extra_mmsi or [])
     ves = {}
     if vessels is not None:
         fish = fishing_call_signs or set()
@@ -159,7 +228,8 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=No
 
 
 def build(visits, hourly, manifest, out_dir, fac=None, zones=None, events=None, vessels=None, installations=None,
-          rules=None, landings=None, coverage=None, min_fraction=0.5, fishing_call_signs=None):
+          rules=None, landings=None, coverage=None, min_fraction=0.5, fishing_call_signs=None, pipeline_loiter=None,
+          pipelines_csv=None, sar_csv=None, dark_inst_m=5000, dark_pipe_m=2000):
     gaps, outage = None, None
     if coverage is not None:
         from spark.gold_logic import covered_hours
@@ -171,11 +241,33 @@ def build(visits, hourly, manifest, out_dir, fac=None, zones=None, events=None, 
             hours = coverage.select("hour_ts")
             outage = [r["hour_ts"] for r in hours.join(ok, hours["hour_ts"] == ok["_h"], "left_anti")
                                                  .where(F.col("hour_ts") >= F.lit(start)).collect()]
-    data = summarise(visits, hourly, zones, events, vessels, landings, gaps, outage, fishing_call_signs)
-    if data is not None:
-        data["fishing_register"] = fishing_call_signs is not None
+    pl = (pipeline_loiter.select("mmsi", "start_ts", "duration_min", "pipeline_name", "medium", "min_dist_m", "avg_sog_kn",
+                                 "lat", "lon").collect() if pipeline_loiter is not None else [])
+    data = summarise(visits, hourly, zones, events, vessels, landings, gaps, outage, fishing_call_signs,
+                     extra_mmsi={r["mmsi"] for r in pl})
     if data is None:
         return None
+    data["fishing_register"] = fishing_call_signs is not None
+    t0 = data["t0"]
+    hrs = lambda ts: int((ts - t0).total_seconds() // 3600)
+    data["pl"] = {"m": [r["mmsi"] for r in pl], "t": [hrs(r["start_ts"]) for r in pl], "d": [int(round(r["duration_min"])) for r in pl],
+                  "p": [r["pipeline_name"] for r in pl], "md": [r["medium"] for r in pl], "x": [int(round(r["min_dist_m"])) for r in pl],
+                  "kn": [round(r["avg_sog_kn"] or 0, 1) for r in pl], "lat": [round(r["lat"], 4) for r in pl], "lon": [round(r["lon"], 4) for r in pl]}
+    lines, segs = pipeline_lines(pipelines_csv)
+    data["pp"] = lines
+    dets, meta = read_sar(sar_csv)
+    if dets is not None and fac is not None:
+        offshore = [(r["inst_name"], r["i_lat"], r["i_lon"]) for r in fac.select("inst_name", "i_lat", "i_lon", "is_onshore").collect()
+                    if not r["is_onshore"] and r["i_lat"] is not None and r["i_lon"] is not None
+                    and math.isfinite(r["i_lat"]) and math.isfinite(r["i_lon"])]
+        first = t0.date().isoformat()
+        near = dark_near_infrastructure([d for d in dets if d["date"] >= first], offshore, segs, dark_inst_m, dark_pipe_m)
+        day = lambda s_: (datetime.fromisoformat(s_) - t0).days
+        data["dk"] = {"t": [day(d["date"]) * 24 for d in near], "lat": [d["lat"] for d in near], "lon": [d["lon"] for d in near],
+                      "n": [d["n"] for d in near], "i": [d["inst"] for d in near], "im": [d["inst_m"] for d in near],
+                      "p": [d["pipe"] for d in near], "pm": [d["pipe_m"] for d in near]}
+        data["dk_meta"] = {**meta, "cells": len(dets), "newest": max((d["date"] for d in dets), default=None),
+                           "inst_m": dark_inst_m, "pipe_m": dark_pipe_m}
     pos = {}
     if fac is not None:                              # positions from the Sodir reference file
         pos = {r["inst_name"]: (r["i_lat"], r["i_lon"], None) for r in fac.select("inst_name", "i_lat", "i_lon").collect()}
@@ -201,7 +293,8 @@ def rules_from_config(cfg):
             "large_ship_min_m": sc.get("large_ship_min_m", 100), "loiter_max_kn": sc.get("loiter_max_kn", 2.0),
             "loiter_min_minutes": sc.get("loiter_min_minutes", 120),
             "ais_gap_min_minutes": sc.get("ais_gap_min_minutes", 30), "fast_kn": sc.get("zone_fast_kn", 10),
-            "gap_alert_h": sc.get("standby_gap_alert_hours", 3)}
+            "gap_alert_h": sc.get("standby_gap_alert_hours", 3), "dark_inst_m": sc.get("dark_inst_m", 5000),
+            "dark_pipe_m": sc.get("dark_pipe_m", 2000)}
 
 
 def build_from_gold(spark, gold, manifest, out_dir, cfg, fac=None):
@@ -214,7 +307,12 @@ def build_from_gold(spark, gold, manifest, out_dir, cfg, fac=None):
                  zones=read("zone_entries"), events=events, vessels=read("vessels"),
                  installations=read("installations"), rules=rules_from_config(cfg), landings=read("helicopter_landings"),
                  coverage=read("feed_coverage_hourly"), min_fraction=cfg.get("surveillance", {}).get("coverage_min_fraction", 0.5),
-                 fishing_call_signs=load_fishing_call_signs(os.path.join(gold, "..", "bronze", "reference", "fishing_vessels.csv")))
+                 fishing_call_signs=load_fishing_call_signs(os.path.join(gold, "..", "bronze", "reference", "fishing_vessels.csv")),
+                 pipeline_loiter=read("pipeline_loitering"),
+                 pipelines_csv=os.path.join(gold, "..", "bronze", "reference", "pipelines.csv"),
+                 sar_csv=os.path.join(gold, "..", "bronze", "gfw", "sar_detections.csv"),
+                 dark_inst_m=cfg.get("surveillance", {}).get("dark_inst_m", 5000),
+                 dark_pipe_m=cfg.get("surveillance", {}).get("dark_pipe_m", 2000))
 
 
 def main():
@@ -310,6 +408,8 @@ button.plain{font:inherit;color:var(--accent);background:var(--surface);border:1
 .sizes span:nth-child(1){width:6px;height:6px}.sizes span:nth-child(2){width:10px;height:10px}.sizes span:nth-child(3){width:14px;height:14px}
 .risk{display:inline-block;font-size:.75rem;font-weight:600;padding:0 8px;border-radius:4px}
 .risk.h{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}.risk.m{background:color-mix(in srgb,var(--signal) 18%,transparent);color:var(--ink)}.risk.l{background:color-mix(in srgb,var(--line) 60%,transparent);color:var(--muted)}
+.legend .line{display:inline-block;width:18px;height:0;border-top:2px solid var(--onshore)}
+.attr{font-size:.75rem;color:var(--muted);margin:8px 0 0}.attr a{color:var(--accent)}
 .glance{margin:12px 0 0;max-width:90ch}.glance:empty{display:none}
 .search input{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);min-width:320px}
 code{font-size:.8125rem;background:color-mix(in srgb,var(--line) 50%,transparent);padding:1px 5px;border-radius:4px}
@@ -414,11 +514,32 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
 </div>
 
 <div data-panel="surv" hidden>
-  <section><h2>Surveillance events near installations</h2><p class="note">Loitering (slow within 5 km for hours) and AIS gaps (silent near an installation). Live data only. Orange: worth a look; grey: ordinary.</p><div class="map" id="mapS"></div></section>
+  <section><h2>Security of offshore infrastructure</h2>
+    <details class="help" open><summary>How to read and use this page</summary>
+      <dl class="defs">
+        <dt>Loitering</dt><dd>A vessel under 2 kn within 5 km of an installation for at least 2 hours.</dd>
+        <dt>AIS gap</dt><dd>A vessel near an installation that sent nothing anywhere for at least 30 minutes, then reappeared.</dd>
+        <dt>Worth a look</dt><dd>An event with no ordinary explanation: not a regular visitor, not a facility's own transmitter, not a large ship at a terminal, not support craft, and not during a feed outage.</dd>
+        <dt>Loitering over a pipeline</dt><dd>A vessel under 2 kn within 500 m of an in-service pipeline (Sodir) for at least 2 hours, at least 5 km from any installation. Anchoring or dragging gear there is a damage and sabotage risk. Cables are not in the Sodir data.</dd>
+        <dt>Dark vessel detection</dt><dd>A vessel seen by satellite radar (Sentinel-1) that matches no AIS signal, within <span class="rv" data-r="dark_inst_m"></span> m of an offshore facility or <span class="rv" data-r="dark_pipe_m"></span> m of a pipeline. Positions are 0.01 degree grid cells (about 1 km), data arrive about 5 days late and only when a satellite passes, and very small boats are not detected. A detection right next to an installation can be a rig or another structure rather than a vessel.</dd>
+      </dl>
+      <ol class="howto">
+        <li>Choose the days with the slider at the top; live AIS data only.</li>
+        <li>Start with "Worth a look", then the pipeline loitering and the dark detections.</li>
+        <li>Click a row to see it on the map, a vessel name to open its profile.</li>
+      </ol>
+    </details></section>
+  <section><h2>Events near installations and pipelines</h2><p class="note">Click a marker for details.</p>
+    <ul class="legend" aria-label="Map legend"><li><span class="dot" style="background:var(--warn)"></span>Events worth a look at an installation</li>
+      <li><span class="dot" style="background:var(--muted)"></span>Ordinary events</li><li><span class="dot" style="background:var(--signal)"></span>Loitering over a pipeline</li>
+      <li><span class="dot" style="background:var(--ink)"></span>Dark vessel detection (radar)</li><li><span class="line"></span>Pipeline in service</li></ul>
+    <div class="map" id="mapS"></div><p class="attr" id="attrS"></p></section>
   <section><h2>Events</h2>
     <div class="bar" style="margin-top:0"><p class="note" id="noteS" style="margin:0"></p>
       <div class="seg" id="survSeg"><button type="button" data-s="look" aria-pressed="true">Worth a look</button><button type="button" data-s="all" aria-pressed="false">All events</button></div></div>
     <div class="scroll" id="tSurv"></div></section>
+  <section><h2>Loitering over pipelines</h2><p class="note" id="notePL"></p><div class="scroll" id="tPL"></div></section>
+  <section><h2>Dark vessel detections near infrastructure</h2><p class="note" id="noteDK"></p><div class="scroll" id="tDK"></div><p class="attr" id="attrDK"></p></section>
 </div>
 
 <div data-panel="vessel" hidden>
@@ -448,7 +569,7 @@ const at = h => new Date(T0 + h * HOUR).toLocaleString('en-GB', {day:'numeric', 
 const dayName = k => new Date(T0 + k * DAY).toLocaleDateString('en-GB', {day:'numeric', month:'short', year:'numeric', timeZone:'UTC'});
 const I = D.inst, V = D.v, H = D.h, Z = D.zn || {i:[],m:[],t:[],d:[],kn:[],x:[]}, E = D.ev || {k:[],i:[],m:[],t:[],d:[],x:[],p:[],f:[]};
 const VES = D.ves || {}, B = D.flag_bits || {};
-const R = Object.assign({min_days:3, window_days:30, large_ship_min_m:100, loiter_max_kn:2, loiter_min_minutes:120, ais_gap_min_minutes:30, fast_kn:10, gap_alert_h:3}, D.rules || {});
+const R = Object.assign({min_days:3, window_days:30, large_ship_min_m:100, loiter_max_kn:2, loiter_min_minutes:120, ais_gap_min_minutes:30, fast_kn:10, gap_alert_h:3, dark_inst_m:5000, dark_pipe_m:2000}, D.rules || {});
 const vname = m => (VES[m] && VES[m][0]) || ('MMSI ' + m);
 let tab = 'traffic', grp = 'all', survMode = 'look', from = Math.max(0, NDAYS - 7), to = NDAYS - 1, vessel = null;
 const charts = {}, maps = {};
@@ -733,10 +854,22 @@ function flagTags(r){
 const evCols = withVessel => [['Type', r => r.gap ? 'AIS gap' : 'loitering']].concat(withVessel ? [['Vessel', r => vlink(r.m)]] : [])
   .concat([['Installation', r => r.inst], ['Start (UTC)', r => at(r.t)], ['Duration', r => dur(r.d), 1], ['Closest', r => num(r.x) + ' m', 1],
            ['Flags', flagTags], ['Why', r => el('div', why(r), 'why')]]);
+const PL = D.pl || {m:[], t:[], d:[], p:[], md:[], x:[], kn:[], lat:[], lon:[]}, PP = D.pp || [];
+const DK = D.dk || {t:[], lat:[], lon:[], n:[], i:[], im:[], p:[], pm:[]}, DKM = D.dk_meta || null;
+function gfwAttribution(box){
+  box = $(box); box.replaceChildren(); if (!DKM) return;
+  const a = el('a', 'Powered by Global Fishing Watch'); a.href = 'https://globalfishingwatch.org'; a.target = '_blank'; a.rel = 'noopener';
+  box.append(a, document.createTextNode('. ' + (DKM.versions || []).join(', ') + ', radar detections not matched to AIS; accessed ' +
+    (DKM.accessed || '').slice(0, 10) + ' at https://globalfishingwatch.org/our-apis/. CC BY-NC 4.0, non-commercial use only.'));
+}
 function surveillance(){
   const all = eventRows(null), look = all.filter(r => has(r.f, 'worth_a_look'));
-  kpis('kpis', [[num(all.length), 'events'], [num(look.length), 'worth a look'], [num(look.filter(r => !r.gap).length), 'loitering worth a look'],
-                [num(look.filter(r => r.gap).length), 'AIS gaps worth a look'], [num(new Set(look.map(r => r.m)).size), 'vessels worth a look']]);
+  const pl = []; for (let k = 0; k < PL.t.length; k++) if (inRange(PL.t[k])) pl.push({m:PL.m[k], t:PL.t[k], d:PL.d[k], p:PL.p[k], md:PL.md[k], x:PL.x[k], kn:PL.kn[k], lat:PL.lat[k], lon:PL.lon[k]});
+  const dk = []; for (let k = 0; k < DK.t.length; k++) if (inRange(DK.t[k])) dk.push({t:DK.t[k], lat:DK.lat[k], lon:DK.lon[k], n:DK.n[k], i:DK.i[k], im:DK.im[k], p:DK.p[k], pm:DK.pm[k]});
+  kpis('kpis', [[num(look.length), 'events worth a look'], [num(look.filter(r => !r.gap).length), 'loitering worth a look'],
+                [num(look.filter(r => r.gap).length), 'AIS gaps worth a look'], [num(pl.length), 'loitering over pipelines'],
+                [DKM ? num(dk.reduce((s, r) => s + r.n, 0)) : '–', 'dark vessel detections']]);
+  document.querySelectorAll('.rv').forEach(e => e.textContent = num(R[e.dataset.r]));
   const rows = (survMode === 'look' ? look : all).sort((a, b) => b.d - a.d);
   $('noteS').textContent = (survMode === 'look' ? 'Events with no ordinary explanation' : 'All events') + ', longest first. Click a row to see it on the map, a vessel name to open its profile.';
   const M = getMap('mapS');
@@ -748,8 +881,35 @@ function surveillance(){
       const mk = L.circleMarker([b.r.lat, b.r.lon], {radius: 5 + 3 * Math.sqrt(b.look || b.n), color: c, weight: 2, fillColor: c, fillOpacity: b.look ? 0.35 : 0.15})
         .bindPopup(popup([name, num(b.look) + ' events worth a look', num(b.n) + ' events in total'])).bindTooltip(name);
       M.layer.addLayer(mk); M.markers[name] = mk; pts.push([b.r.lat, b.r.lon]); }
+    for (const [name, medium, path] of PP)
+      M.layer.addLayer(L.polyline(path, {color: css('--onshore'), weight: 1.5, opacity: 0.7}).bindTooltip(name + (medium ? ' (' + medium.toLowerCase() + ')' : '')));
+    for (const r of pl) {
+      const mk = L.circleMarker([r.lat, r.lon], {radius: 6, color: css('--signal'), weight: 2, fillColor: css('--signal'), fillOpacity: 0.4})
+        .bindPopup(popup([vname(r.m), 'Under ' + R.loiter_max_kn + ' kn for ' + dur(r.d) + ' over ' + r.p, num(r.x) + ' m from the pipeline, ' + at(r.t) + ' UTC']));
+      M.layer.addLayer(mk); M.markers['pl-' + r.m + '-' + r.t] = mk; }
+    for (const r of dk) {
+      const mk = L.circleMarker([r.lat, r.lon], {radius: 4, color: css('--ink'), weight: 1, fillColor: css('--ink'), fillOpacity: 0.7})
+        .bindPopup(popup(['Dark vessel detection, ' + dayName(Math.floor(r.t / 24)), (r.i ? num(r.im) + ' m from ' + r.i : '') + (r.i && r.p ? '; ' : '') + (r.p ? num(r.pm) + ' m from ' + r.p : ''),
+                          'Radar (Sentinel-1) via Global Fishing Watch']));
+      M.layer.addLayer(mk); M.markers['dk-' + r.t + '-' + r.lat + '-' + r.lon] = mk; }
     fit(M, pts); }
+  gfwAttribution('attrS');
   table('tSurv', rows, evCols(true), r => focus('mapS', r.inst));
+  const group = m => isFishing(m) ? 'fishing vessel' : isRescue(m) ? 'rescue craft' : FLEET.has(m) ? 'offshore fleet' : 'rarely near installations';
+  $('notePL').textContent = 'Vessels under ' + R.loiter_max_kn + ' kn within 500 m of an in-service pipeline for at least ' + dur(R.loiter_min_minutes) +
+    ', at least 5 km from any installation; live data, from 10-minute track positions. Longest first; click a row to see it on the map.' +
+    (PP.length ? '' : ' The pipeline list is not loaded yet.');
+  table('tPL', pl.sort((a, b) => b.d - a.d), [['Vessel', r => vlink(r.m)], ['Type', r => SHIP(VES[r.m] && VES[r.m][1])], ['Vessel group', r => group(r.m)],
+    ['Pipeline', r => r.p], ['Carries', r => (r.md || '–').toLowerCase()], ['Start (UTC)', r => at(r.t)], ['Duration', r => dur(r.d), 1],
+    ['Closest', r => num(r.x) + ' m', 1], ['Average speed', r => r.kn.toFixed(1) + ' kn', 1]], r => focus('mapS', 'pl-' + r.m + '-' + r.t));
+  $('noteDK').textContent = DKM
+    ? 'Satellite radar detections with no matching AIS signal, within ' + num(DKM.inst_m) + ' m of an offshore facility or ' + num(DKM.pipe_m) +
+      ' m of an in-service pipeline. Newest radar data: ' + (DKM.newest || '–') + ' (about 5 days behind, and only when a satellite passed). Newest first.'
+    : 'Radar detections are not loaded yet (they need a Global Fishing Watch token on the server).';
+  table('tDK', dk.sort((a, b) => b.t - a.t || b.n - a.n), [['Day (UTC)', r => dayName(Math.floor(r.t / 24))], ['Detections', r => num(r.n), 1],
+    ['Nearest facility', r => r.i ? r.i + ' (' + num(r.im) + ' m)' : '–'], ['Nearest pipeline', r => r.p ? r.p + ' (' + num(r.pm) + ' m)' : '–'],
+    ['Position', r => r.lat.toFixed(2) + ' N, ' + r.lon.toFixed(2) + ' E']], r => focus('mapS', 'dk-' + r.t + '-' + r.lat + '-' + r.lon));
+  gfwAttribution('attrDK');
 }
 
 // ---------- Vessel ----------

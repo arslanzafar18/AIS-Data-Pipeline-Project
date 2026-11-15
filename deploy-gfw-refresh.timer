@@ -1,0 +1,10 @@
+[Unit]
+Description=Fetch Global Fishing Watch radar detections every day
+
+[Timer]
+OnCalendar=*-*-* 06:15:00 UTC
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

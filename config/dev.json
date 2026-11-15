@@ -35,7 +35,14 @@
     "live_since": null,
     "facility_stationary_kn": 1.0,
     "faulty_speed_min_count": 10,
-    "faulty_speed_min_share": 0.01
+    "faulty_speed_min_share": 0.01,
+    "pipeline_near_m": 500,
+    "pipeline_phases": [
+      "IN SERVICE"
+    ],
+    "dark_inst_m": 5000,
+    "dark_pipe_m": 2000,
+    "pipeline_min_shore_m": 15000
   },
   "gold_shuffle_partitions": null,
   "gate": {

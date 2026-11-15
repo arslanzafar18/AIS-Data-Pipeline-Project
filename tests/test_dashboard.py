@@ -110,3 +110,17 @@ def test_fishing_register_is_matched_on_call_sign(spark, tmp_path):
     data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path / "out"),
                                  vessels=vessels, fishing_call_signs=signs))
     assert data["ves"]["1"][4] == 1 and data["ves"]["2"][4] == 0 and data["fishing_register"] is True
+
+
+def test_pipeline_lines_and_dark_detections(tmp_path):
+    p = tmp_path / "pipelines.csv"
+    p.write_text("pipeline_id,name,label,medium,phase,seg_no,lon1,lat1,lon2,lat2\n"
+                 "7,Gas A,GA,Gas,IN SERVICE,0,3.0,60.0,3.1,60.0\n7,Gas A,GA,Gas,IN SERVICE,1,3.1,60.0,3.2,60.1\n"
+                 "7,Gas A,GA,Gas,IN SERVICE,2,4.0,61.0,4.1,61.0\n8,Old,OL,Oil,DECOMMISSIONED,0,5.0,60.0,5.1,60.0\n")
+    lines, segs = dashboard.pipeline_lines(str(p))
+    assert [len(l[2]) for l in lines] == [3, 2] and len(segs) == 3          # the jump starts a new line; old pipe left out
+    dets = [{"date": "d", "lat": 60.004, "lon": 3.05, "n": 1}, {"date": "d", "lat": 60.598, "lon": 3.726, "n": 1},
+            {"date": "d", "lat": 63.0, "lon": 8.0, "n": 1}]
+    near = dashboard.dark_near_infrastructure(dets, [("PLATFORM X", 60.62, 3.726)], segs, 5000, 2000)
+    assert [(r["pipe"], r["pipe_m"], r["inst"]) for r in near] == [("Gas A", 445, None), (None, None, "PLATFORM X")]
+    assert near[1]["inst_m"] == 2446                                         # found across a grid cell edge
