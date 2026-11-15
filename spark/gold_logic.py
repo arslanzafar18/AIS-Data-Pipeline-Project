@@ -7,6 +7,31 @@ def _onshore(df):
     return F.max(c).cast("boolean").alias("is_onshore")
 
 
+def _inst_id(df):
+    """The installation's Sodir number for an aggregate; null when the data has none (the name is then the key)."""
+    return F.max(F.col("inst_id") if "inst_id" in df.columns else F.lit(None).cast("long")).alias("inst_id")
+
+
+def conform_installations(pos: DataFrame, inst: DataFrame) -> DataFrame:
+    """Makes the Sodir number the installation key. inst = the current facility list (inst_id, inst_name).
+    Rows written before Silver stored inst_id get it from their name; then every row takes the CURRENT name of its
+    number, so a renamed installation keeps one history instead of two. Two small broadcast joins, no shuffle."""
+    if "inst_id" not in pos.columns:
+        pos = pos.withColumn("inst_id", F.lit(None).cast("long"))
+    ids = inst.where(F.col("inst_id").isNotNull())
+    by_name = ids.groupBy(F.col("inst_name").alias("_n")).agg(F.min("inst_id").alias("_nid"))
+    by_id = ids.groupBy(F.col("inst_id").alias("_i")).agg(F.min("inst_name").alias("_cur"))
+    p = (pos.join(F.broadcast(by_name), F.col("inst_name") == F.col("_n"), "left")
+            .withColumn("inst_id", F.coalesce(F.col("inst_id"), F.col("_nid"))).drop("_n", "_nid"))
+    return (p.join(F.broadcast(by_id), F.col("inst_id") == F.col("_i"), "left")
+             .withColumn("inst_name", F.coalesce(F.col("_cur"), F.col("inst_name"))).drop("_i", "_cur"))
+
+
+def duplicate_keys(df: DataFrame, keys) -> int:
+    """How many key values occur more than once (0 = the key really is unique). One small shuffle."""
+    return df.groupBy(*keys).count().where("count > 1").count()
+
+
 def build_visits(near: DataFrame, gap_s: int) -> DataFrame:
     """One row per vessel visit to an installation; a silence longer than gap_s starts a new visit."""
     w = Window.partitionBy("mmsi", "inst_name").orderBy("event_ts")
@@ -14,8 +39,8 @@ def build_visits(near: DataFrame, gap_s: int) -> DataFrame:
     s = (near.withColumn("new_visit", F.when(gap.isNull() | (gap > gap_s), 1).otherwise(0))
              .withColumn("visit_no", F.sum("new_visit").over(w)))
     return (s.groupBy("mmsi", "inst_name", "inst_kind", "visit_no")
-             .agg(F.first("name", ignorenulls=True).alias("vessel_name"), _onshore(near), F.first("shipType", ignorenulls=True).alias("ship_type"),
-                  F.min("event_ts").alias("arrival_ts"), F.max("event_ts").alias("departure_ts"),
+             .agg(_inst_id(near), F.first("name", ignorenulls=True).alias("vessel_name"), _onshore(near),
+                  F.first("shipType", ignorenulls=True).alias("ship_type"), F.min("event_ts").alias("arrival_ts"), F.max("event_ts").alias("departure_ts"),
                   F.min("dist_m").alias("min_dist_m"), F.count("*").alias("n_msgs"),
                   F.max(F.col("is_at_installation").cast("int")).alias("entered_zone"),
                   F.sum(F.col("is_at_installation").cast("int")).alias("msgs_in_zone"))
@@ -24,7 +49,7 @@ def build_visits(near: DataFrame, gap_s: int) -> DataFrame:
 
 def build_hourly(near: DataFrame) -> DataFrame:
     return (near.groupBy("inst_name", "inst_kind", F.date_trunc("hour", "event_ts").alias("hour_ts"))
-                .agg(F.countDistinct("mmsi").alias("distinct_vessels"), _onshore(near), F.count("*").alias("position_msgs"),
+                .agg(_inst_id(near), F.countDistinct("mmsi").alias("distinct_vessels"), _onshore(near), F.count("*").alias("position_msgs"),
                      F.sum(F.col("is_at_installation").cast("int")).alias("msgs_in_zone"),
                      F.avg("speedOverGround").alias("avg_sog_kn")))
 
@@ -81,7 +106,8 @@ def build_vessels(vessel_days: DataFrame, faulty_min_count: int = 10, faulty_min
 
 
 def build_installations(spark, cfg, path) -> DataFrame:
-    """One row per installation in the facility filter, with its field, phase and position (from Bronze)."""
+    """One row per installation in the facility filter, with its Sodir number (inst_id, the key), field, phase and
+    position (from Bronze)."""
     from spark.common import filter_facilities
     df = spark.read.option("header", True).csv(path)
     kind, name = cfg.get("facility_kind_col", "fclKind"), cfg.get("facility_name_col", "fclName")
@@ -89,7 +115,9 @@ def build_installations(spark, cfg, path) -> DataFrame:
     col = lambda c, alias: (F.col(c) if c in df.columns else F.lit(None).cast("string")).alias(alias)
     onshore = (F.coalesce(F.col(kind).isin(cfg.get("onshore_kinds", ["ONSHORE FACILITY"])), F.lit(False))
                if kind in df.columns else F.lit(False))
-    return (df.select(col(name, "inst_name"), col(kind, "inst_kind"), col("belong2nm", "field"),
+    id_col = cfg.get("facility_id_col", "fclNpdidFacility")
+    inst_id = (F.col(id_col).cast("long") if id_col in df.columns else F.lit(None).cast("long")).alias("inst_id")
+    return (df.select(inst_id, col(name, "inst_name"), col(kind, "inst_kind"), col("belong2nm", "field"),
                       col("phaseName", "phase"), col("FixMov", "fixed_or_moveable"), onshore.alias("is_onshore"),
                       F.col("centroid_lat").cast("double").alias("lat"), F.col("centroid_lon").cast("double").alias("lon"))
               .where("inst_name is not null and lat is not null and lon is not null")
@@ -114,7 +142,7 @@ def build_zone_entries(near: DataFrame, gap_s: int) -> DataFrame:
     """One row per entry into an installation's 500 m safety zone (use case 2)."""
     z = _sessions(near.where("is_at_installation"), ["mmsi", "inst_name"], gap_s)
     return (z.groupBy("mmsi", "inst_name", "inst_kind", "session_no")
-             .agg(F.first("name", ignorenulls=True).alias("vessel_name"), _onshore(z),
+             .agg(_inst_id(z), F.first("name", ignorenulls=True).alias("vessel_name"), _onshore(z),
                   F.first("shipType", ignorenulls=True).alias("ship_type"),
                   F.min("event_ts").alias("entry_ts"), F.max("event_ts").alias("exit_ts"),
                   F.min("dist_m").alias("min_dist_m"), F.max("speedOverGround").alias("max_sog_kn"),
@@ -133,7 +161,7 @@ def build_loitering(near: DataFrame, gap_s: int, max_kn: float, min_minutes: flo
     slow = near.withColumn("_slow", F.coalesce(F.col("speedOverGround") < max_kn, F.lit(False)))
     s = _sessions(slow, ["mmsi", "inst_name"], gap_s, flag="_slow").where("_slow")
     return (s.groupBy("mmsi", "inst_name", "inst_kind", "session_no")
-             .agg(F.first("name", ignorenulls=True).alias("vessel_name"), _onshore(s),
+             .agg(_inst_id(s), F.first("name", ignorenulls=True).alias("vessel_name"), _onshore(s),
                   F.first("shipType", ignorenulls=True).alias("ship_type"),
                   F.min("event_ts").alias("start_ts"), F.max("event_ts").alias("end_ts"),
                   F.min("dist_m").alias("min_dist_m"), F.avg("speedOverGround").alias("avg_sog_kn"),

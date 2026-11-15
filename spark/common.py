@@ -37,13 +37,16 @@ def filter_facilities(df, flt, kind_col):
 
 
 def load_facilities(spark, cfg, path):
-    """Sodir installation points -> inst_name, inst_kind, is_onshore, i_lat, i_lon (filtered per config)."""
+    """Sodir installation points -> inst_id, inst_name, inst_kind, is_onshore, i_lat, i_lon (filtered per config).
+    inst_id is Sodir's own facility number (config facility_id_col): it stays the same when a facility is renamed."""
     df = spark.read.option("header", True).csv(path)
     kind = cfg.get("facility_kind_col", "fclKind")
     df = filter_facilities(df, cfg.get("facility_filter"), kind)
     kind_c = F.col(kind) if kind in df.columns else F.lit(None).cast("string")
     onshore = F.coalesce(kind_c.isin(cfg.get("onshore_kinds", ["ONSHORE FACILITY"])), F.lit(False))
-    return (df.select(F.col(cfg.get("facility_name_col", "fclName")).alias("inst_name"),
+    id_col = cfg.get("facility_id_col", "fclNpdidFacility")
+    id_c = F.col(id_col).cast("long") if id_col in df.columns else F.lit(None).cast("long")
+    return (df.select(id_c.alias("inst_id"), F.col(cfg.get("facility_name_col", "fclName")).alias("inst_name"),
                       kind_c.alias("inst_kind"), onshore.alias("is_onshore"),
                       F.col("centroid_lat").cast("double").alias("i_lat"),
                       F.col("centroid_lon").cast("double").alias("i_lon"))

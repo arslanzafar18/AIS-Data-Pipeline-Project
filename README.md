@@ -48,7 +48,7 @@ ls data/prod/gold/_LAST_FAILED.json 2>/dev/null       # present = last Gold run 
 **When the monitor opens a `pipeline-alert` issue** (checks: heartbeat, Gold READY and age, disk space, message volume) (the workflow comments on it while failing and closes it when checks pass):
 1. *Heartbeat stale*: `sudo systemctl status ais-collector`, then `tail metrics/prod/events.jsonl` (look for `reader_error`, e.g. expired
    BarentsWatch credentials or the stream being down). `sudo systemctl restart ais-collector`.
-2. *Gold not READY*: read `data/prod/gold/_LAST_FAILED.json` (which gate check failed) and `tail -50 logs/gold_prod.log`.
+2. *Gold not READY*: read `data/prod/gold/_LAST_FAILED.json` (which gate check failed) and `tail -50 logs/gold_prod.log`. If the failed check is `gold_keys_unique`, run `APP_ENV=prod PYTHONPATH=. python scripts/check_keys.py` (read-only) to see which table repeats a key.
    The previous Gold stays published, so readers are unaffected; fix the cause, the next hourly run publishes again.
 3. *Gold too old*: `pgrep -af spark.gold_job` (a run still going?) and `free -g` (out of memory → see `docs/DESIGN_AND_LIMITS.md`).
 4. *Disk almost full* (under 15% free): `du -sh data/prod/*/* | sort -h | tail`; delete old `silver/positions_old_*` copies,

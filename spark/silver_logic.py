@@ -91,6 +91,8 @@ def enrich(v: DataFrame, fac: DataFrame, near_m: float, at_m: float, stationary_
     (5 km in a fjord or harbour catches unrelated traffic). Bounding-box prefilter before exact haversine."""
     if "is_onshore" not in fac.columns:
         fac = fac.withColumn("is_onshore", F.lit(False))
+    if "inst_id" not in fac.columns:      # a facility list without Sodir numbers: the name stays the only key
+        fac = fac.withColumn("inst_id", F.lit(None).cast("long"))
     r_on = near_m if near_m_onshore is None else near_m_onshore
     fac = fac.withColumn("near_r", F.when(F.col("is_onshore"), F.lit(float(r_on))).otherwise(F.lit(float(near_m))))
     dlat = max(near_m, r_on) / 111000.0 * 1.05
@@ -102,7 +104,7 @@ def enrich(v: DataFrame, fac: DataFrame, near_m: float, at_m: float, stationary_
           .where(F.col("dist_m") <= F.col("near_r")))
     w = Window.partitionBy("mmsi", "event_ts").orderBy("dist_m")
     nearest = (j.withColumn("rn", F.row_number().over(w)).where("rn = 1")
-                .select("mmsi", "event_ts", "inst_name", "inst_kind", "is_onshore", "dist_m"))
+                .select("mmsi", "event_ts", "inst_id", "inst_name", "inst_kind", "is_onshore", "dist_m"))
     return (v.join(nearest, ["mmsi", "event_ts"], "left")
              .withColumn("is_near_installation", F.col("inst_name").isNotNull())
              .withColumn("is_at_installation", F.coalesce(F.col("dist_m") <= at_m, F.lit(False)))
@@ -112,7 +114,7 @@ def enrich(v: DataFrame, fac: DataFrame, near_m: float, at_m: float, stationary_
 
 SILVER_COLUMNS = ["mmsi", "event_ts", "ingest_ts", "latency_s", "latitude", "longitude", "speedOverGround",
                   "courseOverGround", "trueHeading", "rateOfTurn", "name", "shipType", "navigationalStatus",
-                  "destination", "callSign", "imo", "shipLength", "shipWidth", "inst_name", "inst_kind", "is_onshore", "dist_m",
+                  "destination", "callSign", "imo", "shipLength", "shipWidth", "inst_id", "inst_name", "inst_kind", "is_onshore", "dist_m",
                   "is_near_installation", "is_at_installation", "is_stationary", "altitude", "is_aircraft", "sog_glitch",
                   "_run_id", "_file", "dt", "hour"]
 
