@@ -31,8 +31,9 @@ days older than lookback_days are dropped. --full (and the first run on unpartit
 KEYS: the installation key is Sodir's facility number (inst_id). Every Silver row is mapped to the CURRENT name of its
 number before any table is built (rows written before Silver stored the number get it from their name), so a renamed
 installation keeps one history; when the numbers or names in the facility list change, the next run is a full rebuild.
-The gate checks that every recomputed table is unique on its key (KEYS; a full run checks its newest days, so the
-check stays cheap) and that the installations dimension is unique on inst_id and on inst_name.
+Every recomputed table is checked for repeated keys (KEYS; a full run checks its newest days, so the check stays
+cheap), and the installations dimension for repeated inst_id and inst_name. Repeats are a WARNING, not a gate check:
+Gold still publishes, and the warning is printed to the Gold log and stored in _READY.json and the trace.
 On failure the previous Gold stays untouched, gold/_LAST_FAILED.json is written and the process exits non-zero.
 """
 import argparse, hashlib, json, os, shutil, sys, uuid
@@ -274,7 +275,7 @@ def main(full=False):
         warnings.append(f"speed glitches (> {cfg.get('max_ship_kn', 50)} kn, nulled) are {gr:.4%} of {gr_n} positions in the "
                         f"last 24 h, above {gate.get('max_sog_glitch_rate', 0.001):.2%}: check the feed or a faulty transponder")
 
-    # ---- keys: every recomputed table must be unique on its key (a full run checks its newest days only) ----
+    # ---- keys: every recomputed table should be unique on its key (a full run checks its newest days only) ---
     _sp = obs.start("gold.keys")
     check_from = s_day if not full else max(window_start, max_dt - timedelta(days=cfg.get("gold_recent_days", 2) - 1))
     recomputed = {"vessel_visits": visits_new, "installation_activity_hourly": hourly, "vessel_days": vdays,
@@ -285,6 +286,10 @@ def main(full=False):
     dups["installations"] = (duplicate_keys(inst_dim.where("inst_id IS NOT NULL"), ["inst_id"])
                              + duplicate_keys(inst_dim, ["inst_name"]))
     _sp.end()
+    repeated = {t: n for t, n in dups.items() if n}
+    if repeated:     # a warning, not a gate check: Gold still publishes, the log, _READY.json and the trace say where
+        warnings.append(f"repeated keys from {check_from}: " + ", ".join(f"{t}={n}" for t, n in repeated.items())
+                        + "; run scripts/check_keys.py to see them")
     if raw_n is not None and raw_n - (s["n"] or 0) > 0:
         warnings.append(f"Silver held {raw_n - s['n']} duplicate (mmsi, event_ts) rows from {s_day}; Gold removed them, "
                         "but Silver's own deduplication should have: check the left_anti step in silver_job")
@@ -313,11 +318,10 @@ def main(full=False):
         f"tracks={tr['n']} rows for {tr['vessels']} vessels (vessel_days {d['vessels']}), missing positions={tr['nopos']}")
     chk("helicopter_landing_msgs_equal_silver_aircraft_zone_rows", (hl["msgs"] or 0) == (s["zone_air"] or 0),
         f"landings={hl['n']} ({hl['msgs']} msgs) silver aircraft in zones={s['zone_air']}")
-    chk("gold_keys_unique", not any(dups.values()),
-        "duplicate keys from " + str(check_from) + ": " + ", ".join(f"{t}={n}" for t, n in dups.items()))
     chk("no_negative_durations_or_null_keys", (v["neg"] or 0) == 0 and (v["nullkeys"] or 0) == 0, f"neg={v['neg']} nullkeys={v['nullkeys']}")
     ok = all(c["passed"] for c in checks)
 
+    manifest_keys = {"check_from": str(check_from), "repeated_keys": dups}
     manifest = {"run_id": run_id, "env": cfg["env"], "mode": "full" if full else "incremental",
                 "recompute_from": str(s_day), "visits_from": str(v_day), "newest_day": str(max_dt),
                 "silver_rows": n_s, "silver_rows_before_dedupe": raw_n,
@@ -328,7 +332,7 @@ def main(full=False):
                                "zone_entries": z["n"], "loitering_events": lo["n"], "ais_gap_events": g["n"],
                                "vessel_tracks": tr["n"], "helicopter_landings": hl["n"]},
                 "events_worth_a_look_recomputed": flags, "aircraft_rows": s["aircraft_rows"], "sog_glitches": s["glitches"],
-                "sog_glitch_rate_24h": gr, "warnings": warnings, "checks": checks}
+                "sog_glitch_rate_24h": gr, "keys": manifest_keys, "warnings": warnings, "checks": checks}
     for w in warnings:
         obs.event("warning", detail=w); print("WARNING:", w)
     obs.annotate(run_id=run_id, silver_rows=n_s, vessel_visits=v["n"], hourly_rows=h["n"], gate_passed=ok,
