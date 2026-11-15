@@ -90,3 +90,29 @@ def test_health_summarises_bronze_columns_per_day_and_reference_headers(tmp_path
     assert sv["cb"] == [2] and sv["bad"] == [1] and sv["unk"] == [{"x": 5}] and sv["abs"] == [["altitude"]]
     assert h["ref"][0]["missing"] == ["lat2"] and h["ref"][0]["columns"] == 3 and h["ref"][0]["updated"].endswith("Z")
     assert h["ref"][1]["columns"] is None and h["ref"][1]["missing"] == []
+
+
+def test_bronze_files_counts_expected_received_and_missing(tmp_path):
+    from spark.dashboard import bronze_files
+    ev = tmp_path / "events.jsonl"
+    rows = [{"ts": "2026-11-10T00:00:05+00:00", "event": "start"}]
+    for k in range(1, 30):                                     # 00:02 .. 00:58, one file per 2 minutes
+        if k not in (10, 11):                                  # two windows lost
+            rows.append({"ts": f"2026-11-10T00:{2 * k:02d}:00+00:00", "event": "flush", "file": "f", "messages": 100})
+    rows.append({"ts": "2026-11-10T00:40:00+00:00", "event": "reader_error"})
+    _write(ev, rows)
+    out = bronze_files(str(ev), T0, T0 + timedelta(hours=1), flush_seconds=120)
+    assert out["t"] == [0] and out["exp"] == [29] and out["files"] == [27] and out["msgs"] == [2700]
+    assert out["errors"] == [1] and out["starts"] == [1] and out["empty"] == [0]
+    assert bronze_files(str(tmp_path / "none.jsonl"), T0, T0) == {k: [] for k in ("t", "exp", "files", "msgs", "empty", "errors", "starts")}
+
+
+def test_health_sums_silver_corrections(tmp_path):
+    q = tmp_path / "quality"
+    q.mkdir()
+    _write(q / "silver_metrics.jsonl", [
+        {"processed_at": "2026-11-10T01:00:00+00:00", "input_rows": 100, "accepted_rows": 90, "rejected_rows": 6,
+         "corrected_sog": 1, "corrected_heading": 2, "corrected_rot": 3, "corrected_shiptype": 4, "corrected_sog_glitch": 5, "aircraft_rows": 7},
+        {"processed_at": "2026-11-10T02:00:00+00:00", "input_rows": 50, "accepted_rows": 50, "rejected_rows": 0}])
+    sv = pipeline_health(T0, str(q), None, None, now=T0 + timedelta(hours=3))["sv"]
+    assert sv["rj"] == [6] and sv["fix"] == [10] and sv["gl"] == [5] and sv["air"] == [7]

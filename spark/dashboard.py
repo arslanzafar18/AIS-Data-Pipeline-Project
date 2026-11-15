@@ -16,7 +16,7 @@ Preview from any Gold folder (read-only on the tables; writes ./dashboard-previe
            PYTHONPATH=. python -m spark.dashboard --gold-dir data/prod/gold [--out folder]
 """
 import argparse, json, math, os, shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pyspark.sql import functions as F
 
 BUCKETS = [(15, "Under 15 min"), (60, "15 to 60 min"), (180, "1 to 3 h"), (720, "3 to 12 h"),
@@ -204,7 +204,42 @@ def reference_columns(files):
     return out
 
 
-def pipeline_health(t0, quality_dir=None, metrics_dir=None, gold_dir=None, now=None, reference=None):
+def bronze_files(events_path, t0, now, flush_seconds=120):
+    """Completeness of live Bronze per day, from the collector's own log (metrics/<env>/events.jsonl): files written
+    against files expected (one every flush_seconds, counted from the first logged event and up to `now` on the
+    last day), messages, empty windows, reader errors and restarts."""
+    days, first = {}, None
+    for e in _jsonl(events_path):
+        ts = _utc_naive(e.get("ts"))
+        if ts is None:
+            continue
+        first = ts if first is None or ts < first else first
+        if ts < t0:
+            continue
+        d = days.setdefault(ts.date(), {"files": 0, "msgs": 0, "empty": 0, "errors": 0, "starts": 0})
+        kind = e.get("event")
+        if kind == "flush":
+            if e.get("file"):
+                d["files"] += 1
+                d["msgs"] += int(e.get("messages") or 0)
+            else:
+                d["empty"] += 1
+        elif kind == "reader_error":
+            d["errors"] += 1
+        elif kind == "start":
+            d["starts"] += 1
+    out = {k: [] for k in ("t", "exp", "files", "msgs", "empty", "errors", "starts")}
+    for day in sorted(days):
+        start = datetime.combine(day, datetime.min.time())
+        begin, end = max(start, first), min(start + timedelta(days=1), now)
+        out["t"].append((day - t0.date()).days * 24)
+        out["exp"].append(max(0, int((end - begin).total_seconds() // flush_seconds)))
+        for k in ("files", "msgs", "empty", "errors", "starts"):
+            out[k].append(days[day][k])
+    return out
+
+
+def pipeline_health(t0, quality_dir=None, metrics_dir=None, gold_dir=None, now=None, reference=None, flush_seconds=120):
     """Plain-Python health data for the Pipeline health tab, from files the pipeline already writes:
     quality/silver_metrics.jsonl (one line per Silver batch) summed per day, quality/gold_runs.jsonl (one line per
     Gold run), the collector heartbeat and the free disk space. Times are hours since t0 like the rest of the page."""
@@ -219,7 +254,8 @@ def pipeline_health(t0, quality_dir=None, metrics_dir=None, gold_dir=None, now=N
         if ts < t0:
             continue
         d = days.setdefault(ts.date(), {"b": 0, "in": 0, "ok": 0, "dup": 0, "p95": 0, "rt": 0.0, "rtx": 0.0,
-                                        "rej": dict.fromkeys(REJECT_REASONS, 0), "cb": 0, "bad": 0, "unk": {}, "abs": None, "lat": []})
+                                        "rej": dict.fromkeys(REJECT_REASONS, 0), "cb": 0, "bad": 0, "unk": {}, "abs": None, "lat": [],
+                                        "rj": 0, "fix": 0, "gl": 0, "air": 0})
         if "absent_keys" in m:                       # Bronze column check (batches written since it exists)
             d["cb"] += 1
             d["bad"] += m.get("bronze_contract_bad_rows") or 0
@@ -230,6 +266,10 @@ def pipeline_health(t0, quality_dir=None, metrics_dir=None, gold_dir=None, now=N
         d["b"] += 1
         d["in"] += m.get("input_rows") or 0
         d["ok"] += m.get("accepted_rows") or 0
+        d["rj"] += m.get("rejected_rows") or 0
+        d["fix"] += sum(m.get(k) or 0 for k in ("corrected_sog", "corrected_heading", "corrected_rot", "corrected_shiptype"))
+        d["gl"] += m.get("corrected_sog_glitch") or 0
+        d["air"] += m.get("aircraft_rows") or 0
         d["dup"] += (m.get("in_batch_duplicates") or 0) + (m.get("cross_batch_duplicates") or 0)
         if m.get("source", "live") == "live":              # backfill batches are weeks old by design
             d["p95"] = max(d["p95"], m.get("latency_p95_s") or 0)
@@ -240,7 +280,7 @@ def pipeline_health(t0, quality_dir=None, metrics_dir=None, gold_dir=None, now=N
             d["rej"][r] += m.get("rej_" + r) or 0
     order = sorted(days)
     sv = {"t": [(k - t0.date()).days * 24 for k in order]}
-    for f in ("b", "in", "ok", "dup", "p95", "rtx"):
+    for f in ("b", "in", "ok", "dup", "p95", "rtx", "rj", "fix", "gl", "air"):
         sv[f] = [round(days[k][f], 1) for k in order]
     med = lambda a: sorted(a)[len(a) // 2] if a else 0
     sv["p95m"] = [med(days[k]["lat"]) for k in order]      # typical batch; p95 keeps the worst batch of the day
@@ -271,7 +311,8 @@ def pipeline_health(t0, quality_dir=None, metrics_dir=None, gold_dir=None, now=N
         disk = round(100.0 * u.free / u.total, 1)
     iso = lambda d: None if d is None else d.isoformat() + "Z"
     return {"built": iso(now), "heartbeat": iso(hb), "silver_batch": iso(last_batch), "disk_free_pct": disk,
-            "sv": sv, "runs": runs, "ref": reference_columns(reference or [])}
+            "sv": sv, "runs": runs, "ref": reference_columns(reference or []),
+            "bf": bronze_files(metrics_dir and os.path.join(metrics_dir, "events.jsonl"), t0, now, flush_seconds)}
 
 
 def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=None, gaps=None, outage_hours=None,
@@ -346,7 +387,7 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=No
 def build(visits, hourly, manifest, out_dir, fac=None, zones=None, events=None, vessels=None, installations=None,
           rules=None, landings=None, coverage=None, min_fraction=0.5, fishing_call_signs=None, pipeline_loiter=None,
           pipelines_csv=None, sar_csv=None, dark_inst_m=5000, dark_pipe_m=2000, quality_dir=None, metrics_dir=None,
-          gold_dir=None, reference=None):
+          gold_dir=None, reference=None, flush_seconds=120):
     gaps, outage = None, None
     if coverage is not None:
         from spark.gold_logic import covered_hours
@@ -397,7 +438,7 @@ def build(visits, hourly, manifest, out_dir, fac=None, zones=None, events=None, 
     if coverage is not None:                         # messages per hour over all positions, for the health tab
         fc = coverage.where(F.col("hour_ts") >= F.lit(t0)).select("hour_ts", "msgs").orderBy("hour_ts").collect()
         data["fc"] = {"t": [hrs(r["hour_ts"]) for r in fc], "n": [int(r["msgs"] or 0) for r in fc]}
-    data["ph"] = pipeline_health(t0, quality_dir, metrics_dir, gold_dir, reference=reference)
+    data["ph"] = pipeline_health(t0, quality_dir, metrics_dir, gold_dir, reference=reference, flush_seconds=flush_seconds)
     data["rules"] = rules or {}
     page = PAGE.replace("__DATA__", json.dumps(data, default=_iso, separators=(",", ":")).replace("</", "<\\/"))
     os.makedirs(out_dir, exist_ok=True)
@@ -435,7 +476,7 @@ def build_from_gold(spark, gold, manifest, out_dir, cfg, fac=None):
                  dark_inst_m=cfg.get("surveillance", {}).get("dark_inst_m", 5000),
                  dark_pipe_m=cfg.get("surveillance", {}).get("dark_pipe_m", 2000),
                  quality_dir=os.path.join(gold, "..", "quality"), metrics_dir=cfg.get("metrics_dir"), gold_dir=gold,
-                 reference=reference_files(gold, cfg))
+                 reference=reference_files(gold, cfg), flush_seconds=int(cfg.get("flush_seconds", 120)))
 
 
 def reference_files(gold, cfg):
@@ -543,6 +584,7 @@ button.plain{font:inherit;color:var(--accent);background:var(--surface);border:1
 .risk{display:inline-block;font-size:.75rem;font-weight:600;padding:0 8px;border-radius:4px}
 .risk.h{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}.risk.m{background:color-mix(in srgb,var(--signal) 18%,transparent);color:var(--ink)}.risk.l{background:color-mix(in srgb,var(--line) 60%,transparent);color:var(--muted)}
 .legend .line{display:inline-block;width:18px;height:0;border-top:2px solid var(--onshore)}
+h3.sub{font-size:.9375rem;font-weight:600;margin:18px 0 2px}section>h3.sub:first-of-type{margin-top:10px}
 .attr{font-size:.75rem;color:var(--muted);margin:8px 0 0}.attr a{color:var(--accent)}
 .glance{margin:12px 0 0;max-width:90ch}.glance:empty{display:none}
 .search input{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);min-width:320px}
@@ -680,27 +722,32 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
 
 <div data-panel="health" hidden>
   <section><h2>Pipeline health</h2>
-    <p class="note">How the pipeline itself is doing in the selected days: is data arriving, how much Silver rejects, and whether each hourly Gold run published.</p>
+    <p class="note">How the pipeline itself is doing in the selected days, layer by layer: did the data arrive in Bronze, what did Silver reject or correct, and did each hourly Gold run publish.</p>
     <details class="help"><summary>How to read this tab</summary>
       <ul class="howto">
         <li><b>Freshness</b> says when each layer last did its work. Anything marked <span class="tag look">Check</span> is older than normal.</li>
-        <li><b>Messages per hour</b> shows the live feed. Orange hours are feed outages: under half the median volume. Events in those hours are flagged, not trusted.</li>
-        <li><b>Bronze columns</b> checks that what arrives still has the expected shape. For live AIS, each Silver batch counts records missing one of the five Bronze columns, new fields in the AIS messages, and expected fields no message carried. For the reference files, it checks the columns the pipeline reads.</li>
-        <li><b>Rejected rows</b> are rows Silver refused, by reason. They are kept in <code>silver/rejects</code> with the raw message. A sudden rise usually means a change at the source.</li>
-        <li><b>Gold runs</b>: a blocked run (the quality gate failed) or a crash leaves the previous Gold published. The log names the failed checks and any warning, such as repeated keys.</li>
+        <li><b>Bronze checks</b>: did every expected file arrive (the collector writes one every 2 minutes, 720 a day), how many messages per hour reached Silver (orange hours are feed outages), do the AIS messages still have the expected fields, and do the reference files still have the columns the pipeline reads.</li>
+        <li><b>Silver checks</b>: per day, the rows that came in, were accepted, were rejected (by reason; kept in <code>silver/rejects</code> with the raw message), were removed as duplicates, or had an impossible value corrected.</li>
+        <li><b>Gold checks</b>: every hourly run. A run blocked by the quality gate, or a crash, leaves the previous Gold published; the log names the failed checks and any warning.</li>
       </ul>
-      <p class="note">Sources: the collector heartbeat, <code>quality/silver_metrics.jsonl</code> (one line per Silver batch), the Gold table <code>feed_coverage_hourly</code> and <code>quality/gold_runs.jsonl</code> (one line per Gold run).</p>
+      <p class="note">Sources: the collector's log and heartbeat, <code>quality/silver_metrics.jsonl</code> (one line per Silver batch), the Gold table <code>feed_coverage_hourly</code> and <code>quality/gold_runs.jsonl</code> (one line per Gold run).</p>
     </details></section>
   <section><h2>Freshness</h2><p class="note" id="nFresh"></p><div class="scroll" id="tFresh"></div></section>
-  <section><h2>Bronze columns: live AIS</h2><p class="note" id="nBronze"></p><div class="scroll" id="tBronze"></div></section>
-  <section><h2>Bronze columns: reference files</h2><p class="note">Does each reference file still have every column the pipeline reads? A weekly or daily fetch refuses to replace a file whose source changed its fields, so a problem here also shows as an old update time.</p><div class="scroll" id="tRef"></div></section>
-  <section><h2>Messages per hour</h2><p class="note" id="nFeed"></p><div class="chart"><canvas id="cFeed"></canvas></div></section>
-  <div class="grid">
-    <section><h2>Rejected rows per day</h2><p class="note" id="nRej"></p><div class="chart"><canvas id="cRej"></canvas></div></section>
-    <section><h2>Silver batch times per day</h2><p class="note" id="nSil"></p><div class="chart"><canvas id="cSil"></canvas></div></section>
-  </div>
-  <section><h2>Gold runs</h2><p class="note" id="nRuns"></p><div class="chart"><canvas id="cRuns"></canvas></div></section>
-  <section><h2>Gold run log</h2><p class="note">Newest first. A blocked or crashed run leaves the previous Gold published.</p><div class="scroll" id="tRuns"></div></section>
+  <section><h2>Bronze checks</h2>
+    <h3 class="sub">Files received</h3><p class="note" id="nFiles"></p><div class="scroll" id="tFiles"></div>
+    <h3 class="sub">Messages per hour</h3><p class="note" id="nFeed"></p><div class="chart"><canvas id="cFeed"></canvas></div>
+    <h3 class="sub">Fields in the AIS messages</h3><p class="note" id="nBronze"></p><div class="scroll" id="tBronze"></div>
+    <h3 class="sub">Reference files</h3><p class="note">Does each reference file still have every column the pipeline reads? A fetch refuses to replace a file whose source changed its fields, so a problem here also shows as an old update time.</p><div class="scroll" id="tRef"></div>
+  </section>
+  <section><h2>Silver checks</h2><p class="note" id="nSilT"></p><div class="scroll" id="tSil"></div>
+    <div class="grid">
+      <div><h3 class="sub">Rejected rows per day, by reason</h3><div class="chart"><canvas id="cRej"></canvas></div></div>
+      <div><h3 class="sub">Batch times per day</h3><p class="note" id="nSil"></p><div class="chart"><canvas id="cSil"></canvas></div></div>
+    </div>
+  </section>
+  <section><h2>Gold checks</h2><p class="note" id="nRuns"></p><div class="chart"><canvas id="cRuns"></canvas></div>
+    <h3 class="sub">Run log</h3><p class="note">Newest first. <b>Silver rows read</b>: the Silver positions this run read for the days it recomputed (its input). <b>Repeated keys</b>: rows in the Gold tables it built that share a key with another row (its output; should be 0).</p><div class="scroll" id="tRuns"></div>
+  </section>
 </div>
 
 <div data-panel="vessel" hidden>
@@ -1126,68 +1173,89 @@ const ageMin = (ts, ref) => ts ? (ref - Date.parse(ts)) / 6e4 : null;
 function health(){
   const P = D.ph || {}, SV = P.sv || {t: [], rej: {}}, ALL = P.runs || [], RU = ALL.filter(r => inRange(r.t));
   const FC = D.fc || {t: [], n: []}, OUT = new Set(D.out || []), built = Date.parse(P.built || new Date().toISOString());
+  const BF = P.bf || {t: []};
   const ks = SV.t.map((_, k) => k).filter(k => inRange(SV.t[k]));
   const sum = a => ks.reduce((s, k) => s + ((a || [])[k] || 0), 0);
   const input = sum(SV.in), rej = REASONS.reduce((s, [r]) => s + sum(SV.rej[r]), 0);
   const bad = RU.filter(r => r.s !== 'READY');
+  const fileRows = BF.t.map((t, k) => ({t, exp: BF.exp[k], got: BF.files[k], msgs: BF.msgs[k], empty: BF.empty[k], errors: BF.errors[k], starts: BF.starts[k]}))
+    .filter(r => inRange(r.t)).map(r => Object.assign(r, {miss: Math.max(0, r.exp - r.got - r.empty)}))
+    .map(r => Object.assign(r, {issue: r.exp > 0 && r.miss > Math.max(2, 0.01 * r.exp)}));
   const bz = ks.map(k => ({t: SV.t[k], cb: (SV.cb || [])[k] || 0, bad: (SV.bad || [])[k] || 0, unk: (SV.unk || [])[k] || {}, abs: (SV.abs || [])[k] || []}))
     .map(r => Object.assign(r, {issue: r.cb > 0 && (r.bad > 0 || Object.keys(r.unk).length > 0 || r.abs.some(a => !OPTIONAL.includes(a)))}));
   const refBad = (P.ref || []).filter(r => r.missing.length);
   kpis('kpis', [[num(RU.length - bad.length) + ' of ' + num(RU.length), 'Gold runs published'], [num(bad.length), 'Gold runs blocked or crashed'],
     [input ? (100 * rej / input).toFixed(2) + '%' : '–', 'Silver reject rate'], [num(sum(SV.dup)), 'duplicates removed in Silver'],
     [num((D.out || []).filter(inRange).length), 'feed outage hours'],
-    [num(bz.filter(r => r.issue).length + refBad.length), 'Bronze column issues']]);
-  const checked = bz.filter(r => r.cb > 0);
-  $('nBronze').textContent = checked.length
-    ? 'One row per day, newest first. Field names are the AIS message fields as BarentsWatch sends them. A field absent from one small batch is normal, so absence counts only when no batch of the day had it (altitude only comes from aircraft).'
-    : 'No batch in these days was checked yet: the check starts with this version of the pipeline.';
-  table('tBronze', bz.filter(r => r.cb > 0).reverse(), [['', r => el('span', r.issue ? 'Check' : 'OK', r.issue ? 'tag look' : 'tag')],
-    ['Day', r => dayName(r.t / 24)], ['Batches checked', r => num(r.cb), 1],
-    ['Records missing Bronze columns', r => num(r.bad), 1],
-    ['New fields in messages', r => el('div', Object.entries(r.unk).map(([k, n]) => k + ' (' + num(n) + ' rows)').join(', ') || 'none', 'why')],
-    ['Expected fields absent all day', r => el('div', r.abs.map(a => a + (ESSENTIAL.includes(a) ? ' (essential)' : OPTIONAL.includes(a) ? ' (aircraft only)' : '')).join(', ') || 'none', 'why')]]);
-  table('tRef', P.ref || [], [['File', r => r.file], ['Updated', r => r.updated ? when(r.updated) : 'no file'],
-    ['Columns', r => r.columns == null ? '–' : num(r.columns), 1], ['Columns the pipeline reads', r => num(r.required), 1],
-    ['Missing', r => el('div', r.missing.join(', ') || (r.columns == null ? '–' : 'none'), 'why')],
-    ['', r => r.columns == null ? '–' : el('span', r.missing.length ? 'Check' : 'OK', r.missing.length ? 'tag look' : 'tag')]]);
+    [num(fileRows.filter(r => r.issue).length + bz.filter(r => r.issue).length + refBad.length), 'Bronze issues']]);
+  const tag = (issue, none) => none ? '–' : el('span', issue ? 'Check' : 'OK', issue ? 'tag look' : 'tag');
 
+  // freshness: the two Gold rows differ only when the newest run was blocked or crashed
   const lastRun = ALL.length ? ALL[ALL.length - 1] : null, mf = D.manifest || {};
   const fresh = [
     ['Collector', 'last Bronze file written', P.heartbeat, 10],
     ['Silver', 'last batch processed', P.silver_batch, 15],
-    ['Gold', 'last published', mf.finished_at, 120],
-    ['Gold', 'last run' + (lastRun ? ' (' + lastRun.s.toLowerCase() + ')' : ' (logged from the next deploy)'), lastRun && lastRun.at, 120, lastRun && lastRun.s !== 'READY'],
-  ].map(([layer, what, ts, lim, failed]) => ({layer, what, ts, age: ageMin(ts, built), lim, failed, none: !ts && layer === 'Gold' && !ALL.length}));
-  table('tFresh', fresh, [['Layer', r => r.layer], ['What', r => r.what], ['When', r => r.ts ? when(r.ts) : 'no record'],
-    ['Age', r => r.age == null ? '–' : dur(r.age), 1],
-    ['', r => r.none ? '–' : el('span', r.age == null || r.age > r.lim || r.failed ? 'Check' : 'OK', r.age == null || r.age > r.lim || r.failed ? 'tag look' : 'tag')]]);
+    ['Gold data', 'last published: what the dashboard and users see', mf.finished_at, 120],
+    ['Gold job', 'last run, whatever its result' + (lastRun ? ': ' + (lastRun.s === 'READY' ? 'published' : lastRun.s === 'FAILED' ? 'blocked by the gate' : 'crashed') : ' (logged from the next deploy)'),
+     lastRun && lastRun.at, 120, lastRun && lastRun.s !== 'READY'],
+  ].map(([layer, what, ts, lim, failed]) => ({layer, what, ts, age: ageMin(ts, built), lim, failed, none: !ts && layer === 'Gold job' && !ALL.length}));
+  table('tFresh', fresh, [['', r => tag(r.age == null || r.age > r.lim || r.failed, r.none)], ['Layer', r => r.layer], ['What', r => r.what],
+    ['When', r => r.ts ? when(r.ts) : 'no record'], ['Age', r => r.age == null ? '–' : dur(r.age), 1]]);
   $('nFresh').textContent = 'As of ' + when(P.built) + ', when this page was built (after each Gold run), so the ages do not grow while you watch. '
+    + 'The two Gold rows show the same run unless the newest run was blocked or crashed; then the data users see is older than the last attempt. '
     + (P.disk_free_pct == null ? '' : 'Free disk space: ' + P.disk_free_pct + '%' + (P.disk_free_pct < 15 ? ', below the 15% the monitor alerts on.' : '.'));
 
+  // Bronze checks
+  $('nFiles').textContent = fileRows.length ? 'Files the collector wrote against the files expected (one every 2 minutes since it started that day). '
+      + 'Empty windows (no message in 2 minutes) are logged but write no file. Restarts include deploys.'
+    : 'No collector log in these days.';
+  table('tFiles', fileRows.slice().reverse(), [['', r => tag(r.issue)], ['Day', r => dayName(r.t / 24)], ['Expected files', r => num(r.exp), 1],
+    ['Received', r => num(r.got), 1], ['Empty windows', r => num(r.empty), 1], ['Missing', r => num(r.miss), 1], ['Messages', r => num(r.msgs), 1],
+    ['Reader errors', r => num(r.errors), 1], ['Restarts', r => num(r.starts), 1]]);
   const fi = FC.t.map((_, k) => k).filter(k => inRange(FC.t[k]));
   const nOut = fi.filter(k => OUT.has(FC.t[k])).length;
   $('nFeed').textContent = 'All AIS messages per hour that reached Silver. ' + (nOut ? nOut + ' hour' + (nOut === 1 ? ' is' : 's are') + ' marked as feed outage (orange).' : 'No feed outage in these days.');
   chart('cFeed', {type: 'bar', data: {labels: fi.map(k => at(FC.t[k])), datasets: [{label: 'Messages', data: fi.map(k => FC.n[k]),
       backgroundColor: fi.map(k => OUT.has(FC.t[k]) ? css('--signal') : css('--accent')), barPercentage: 1, categoryPercentage: 1}]},
     options: {maintainAspectRatio: false, animation: false, plugins: {legend: {display: false}}, scales: {x: {ticks: {maxTicksLimit: 12}, grid: {display: false}}, y: {beginAtZero: true}}}});
+  $('nBronze').textContent = bz.some(r => r.cb > 0)
+    ? 'Checked on every Silver batch. A field absent from one small batch is normal, so absence counts only when no batch of the day had it (altitude only comes from aircraft).'
+    : 'No batch in these days was checked yet: the check starts with this version of the pipeline.';
+  table('tBronze', bz.filter(r => r.cb > 0).reverse(), [['', r => tag(r.issue)],
+    ['Day', r => dayName(r.t / 24)], ['Batches checked', r => num(r.cb), 1],
+    ['Records missing a Bronze column', r => num(r.bad), 1],
+    ['New fields', r => el('div', Object.entries(r.unk).map(([k, n]) => k + ' (' + num(n) + ' rows)').join(', ') || 'none', 'why')],
+    ['Expected fields absent all day', r => el('div', r.abs.map(a => a + (ESSENTIAL.includes(a) ? ' (essential)' : OPTIONAL.includes(a) ? ' (aircraft only)' : '')).join(', ') || 'none', 'why')]]);
+  table('tRef', P.ref || [], [['', r => tag(r.missing.length > 0, r.columns == null)], ['File', r => r.file], ['Updated', r => r.updated ? when(r.updated) : 'no file'],
+    ['Columns', r => r.columns == null ? '–' : num(r.columns), 1], ['Columns the pipeline reads', r => num(r.required), 1],
+    ['Missing', r => el('div', r.missing.join(', ') || (r.columns == null ? '–' : 'none'), 'why')]]);
 
+  // Silver checks: one row per day, reject reasons spelled out
+  const reasonsOf = k => REASONS.filter(([r]) => (SV.rej[r] || [])[k]).map(([r, l]) => l + ' ' + num(SV.rej[r][k])).join(', ');
+  $('nSilT').textContent = num(rej) + ' of ' + num(input) + ' rows rejected in these days (' + (input ? (100 * rej / input).toFixed(3) : 0)
+    + '%). Rows in = accepted + rejected + duplicates removed. Corrected values (speed 102.3, heading 511 and similar "not available" codes, impossible speeds) are nulled but the row is kept.';
+  table('tSil', ks.slice().reverse(), [['', k => tag((SV.in[k] ? (SV.rj || [])[k] / SV.in[k] : 0) > 0.01)], ['Day', k => dayName(SV.t[k] / 24)],
+    ['Rows in', k => num(SV.in[k]), 1], ['Accepted', k => num(SV.ok[k]), 1], ['Rejected', k => num((SV.rj || [])[k]), 1],
+    ['Duplicates', k => num(SV.dup[k]), 1], ['Values corrected', k => num((SV.fix || [])[k]), 1],
+    ['Impossible speeds', k => num((SV.gl || [])[k]), 1], ['Aircraft rows', k => num((SV.air || [])[k]), 1],
+    ['Reject reasons', k => el('div', reasonsOf(k) || 'none', 'why')]]);
   const dl = ks.map(k => dayName(SV.t[k] / 24));
-  const pal = [css('--warn'), css('--signal'), css('--onshore'), css('--accent'), css('--muted'), css('--ink'), css('--line')];
+  const pal = [css('--warn'), css('--signal'), css('--onshore'), css('--accent'), css('--muted'), css('--ink'), css('--line'), css('--warn')];
   const used = REASONS.map((r, j) => [r, j]).filter(([[r]]) => sum(SV.rej[r]) > 0);
-  $('nRej').textContent = num(rej) + ' of ' + num(input) + ' rows rejected in these days' + (used.length ? '; rejected rows are kept with the raw message in silver/rejects.' : '.');
   chart('cRej', {type: 'bar', data: {labels: dl, datasets: used.map(([[r, l], j]) => ({label: l, data: ks.map(k => SV.rej[r][k]), backgroundColor: pal[j]}))},
     options: {maintainAspectRatio: false, animation: false, plugins: {legend: {position: 'bottom'}},
               scales: {x: {stacked: true, ticks: {maxTicksLimit: 10}, grid: {display: false}}, y: {stacked: true, beginAtZero: true, ticks: {precision: 0}}}}});
   const old = ks.filter(k => SV.p95[k] > 86400);
-  $('nSil').textContent = 'Average and slowest batch runtime, and the typical live batch\'s 95th-percentile message age when stored (seconds; historic backfill batches left out).'
-    + (old.length ? ' Very old messages (some batch\'s p95 over a day): ' + old.map(k => dayName(SV.t[k] / 24) + ' (' + dur(SV.p95[k] / 60) + ')').join(', ') + '.' : '');
+  $('nSil').textContent = 'Seconds. Message age: the typical live batch\'s 95th percentile when stored (backfill left out).'
+    + (old.length ? ' Very old messages in some batch: ' + old.map(k => dayName(SV.t[k] / 24) + ' (' + dur(SV.p95[k] / 60) + ')').join(', ') + '.' : '');
   chart('cSil', {type: 'line', data: {labels: dl, datasets: [
-      {label: 'Average batch (s)', data: ks.map(k => SV.rt[k]), borderColor: css('--accent'), backgroundColor: css('--accent'), pointRadius: 2},
-      {label: 'Slowest batch (s)', data: ks.map(k => SV.rtx[k]), borderColor: css('--signal'), backgroundColor: css('--signal'), pointRadius: 2},
-      {label: 'Message age p95, typical batch (s)', data: ks.map(k => (SV.p95m || SV.p95)[k]), borderColor: css('--onshore'), backgroundColor: css('--onshore'), pointRadius: 2}]},
+      {label: 'Average batch', data: ks.map(k => SV.rt[k]), borderColor: css('--accent'), backgroundColor: css('--accent'), pointRadius: 2},
+      {label: 'Slowest batch', data: ks.map(k => SV.rtx[k]), borderColor: css('--signal'), backgroundColor: css('--signal'), pointRadius: 2},
+      {label: 'Message age p95', data: ks.map(k => (SV.p95m || SV.p95)[k]), borderColor: css('--onshore'), backgroundColor: css('--onshore'), pointRadius: 2}]},
     options: {maintainAspectRatio: false, animation: false, plugins: {legend: {position: 'bottom'}}, scales: {x: {ticks: {maxTicksLimit: 10}, grid: {display: false}}, y: {beginAtZero: true}}}});
 
-  $('nRuns').textContent = RU.length ? 'Runtime of each run in seconds. Teal: published; orange: full rebuild; red: blocked by the gate or crashed.'
+  // Gold checks
+  $('nRuns').textContent = RU.length ? 'Runtime of each hourly run in seconds. Teal: published; orange: published full rebuild; red: blocked by the gate or crashed.'
     : 'No Gold runs logged in these days. The run log starts with this version of the pipeline.';
   const short = s => new Date(s).toLocaleString('en-GB', {day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'UTC'});
   chart('cRuns', {type: 'bar', data: {labels: RU.map(r => short(r.at)), datasets: [{label: 'Runtime (s)', data: RU.map(r => r.rt),
@@ -1195,8 +1263,8 @@ function health(){
     options: {maintainAspectRatio: false, animation: false, plugins: {legend: {display: false}}, scales: {x: {ticks: {maxTicksLimit: 12}, grid: {display: false}}, y: {beginAtZero: true}}}});
   table('tRuns', RU.slice().reverse(), [['Finished (UTC)', r => short(r.at)],
     ['Status', r => el('span', r.s === 'READY' ? 'published' : r.s === 'FAILED' ? 'blocked by gate' : 'crashed', r.s === 'READY' ? 'tag' : 'tag look')],
-    ['Mode', r => r.m || '–'], ['Runtime', r => r.rt == null ? '–' : r.rt < 120 ? Math.round(r.rt) + ' s' : (r.rt / 60).toFixed(1) + ' min', 1], ['Silver rows', r => num(r.rows), 1],
-    ['Repeated keys', r => r.k == null ? '–' : num(r.k), 1],
+    ['Mode', r => r.m || '–'], ['Runtime', r => r.rt == null ? '–' : r.rt < 120 ? Math.round(r.rt) + ' s' : (r.rt / 60).toFixed(1) + ' min', 1],
+    ['Silver rows read', r => num(r.rows), 1], ['Repeated keys', r => r.k == null ? '–' : num(r.k), 1],
     ['Failed checks and warnings', r => el('div', [...(r.f || []).map(c => 'failed: ' + c), ...(r.w || [])].join('; ') || '–', 'why')]]);
 }
 
