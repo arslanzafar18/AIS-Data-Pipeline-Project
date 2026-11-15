@@ -345,6 +345,12 @@ def main(full=False):
                "layout": LAYOUT},
               open(P("gold/_state.json"), "w"), indent=2)
     print(json.dumps(manifest, indent=2))
+    try:                                            # pipeline loitering reads the published tracks; never fails Gold
+        from spark import gold_pipelines
+        with obs.span("gold.pipeline_loitering"):
+            gold_pipelines.run(spark, cfg, P)
+    except Exception as e:
+        print(f"pipeline loitering not updated: {e!r}")
     try:                                            # the dashboard must never fail Gold
         from spark import dashboard
         from spark.common import load_facilities

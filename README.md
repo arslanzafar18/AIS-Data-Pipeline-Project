@@ -26,7 +26,8 @@ All commands from `~/AIS-Data-Pipeline-Project`. `PY=/home/ubuntu/spark-env/bin/
 |---|---|---|
 | `ais-collector` | Bronze: live stream → one gzip file per 120 s | `metrics/prod/events.jsonl`, `journalctl -u ais-collector` |
 | `ais-pipeline-loop` | Silver every 120 s, Gold hourly (gated, incremental) | `logs/silver_prod.log`, `logs/gold_prod.log` |
-| `sodir-refresh.timer` | Sodir facilities → `bronze/reference` (Mondays 05:00 UTC) | `journalctl -u sodir-refresh` |
+| `sodir-refresh.timer` | Sodir facilities and pipelines → `bronze/reference` (Mondays 05:00 UTC) | `journalctl -u sodir-refresh` |
+| `gfw-refresh.timer` | Global Fishing Watch radar detections not matched to AIS → `bronze/gfw/` (daily 06:15 UTC; needs `GFW_TOKEN` in `.env`; non-commercial use only) | `journalctl -u gfw-refresh` |
 | `fishing-refresh.timer` | Norwegian fishing vessel register → `bronze/reference/fishing_vessels.csv` (Mondays 05:30 UTC; owners dropped) | `journalctl -u fishing-refresh` |
 | `bronze-retention.timer` | Deletes live Bronze files older than `bronze_retention_days` (30) that Silver has processed (03:30 UTC) | `journalctl -u bronze-retention` |
 | `ais-dashboard` | Serves the Gold dashboard on localhost:8050 | `journalctl -u ais-dashboard` |
@@ -94,4 +95,4 @@ Never merge during a maintenance job: deploy restarts the loop.
 | `.github/workflows/` | `ci.yml` (tests, e2e, deploy), `monitor.yml` (heartbeat + Gold readiness) |
 | `tests/`, `scripts/` | Unit tests; demo, benchmark, status and report tools |
 Deploy and monitor run on the self-hosted runner on the always-on host, so no repository secrets are needed; the monitor reads the heartbeat and Gold manifest as local files.
-Data: Barentswatch/Kystverket open AIS and Sodir FactPages under NLOD — keep source attribution.
+Data: Barentswatch/Kystverket open AIS and Sodir FactPages under NLOD; Fiskeridirektoratet vessel register (owners dropped); radar detections Powered by Global Fishing Watch (https://globalfishingwatch.org, CC BY-NC 4.0, non-commercial use only). Keep source attribution.
