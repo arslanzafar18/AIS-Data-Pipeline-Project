@@ -1,7 +1,7 @@
 """Re-enrich existing Silver with the current facility list, radii and row-level rules, without reprocessing Bronze.
 
 Rows are unchanged; recomputed per row:
-  - installation columns (inst_name, inst_kind, is_onshore, dist_m, is_near_installation, is_at_installation,
+  - installation columns (inst_id, inst_name, inst_kind, is_onshore, dist_m, is_near_installation, is_at_installation,
     is_stationary) with silver_logic.enrich;
   - is_aircraft (SAR-aircraft MMSI range, or an altitude where Silver already has one);
   - the ship speed cap: speedOverGround above max_ship_kn on a non-aircraft row is nulled and flagged sog_glitch.
@@ -19,7 +19,7 @@ from spark import silver_logic as L
 from spark.common import load_facilities
 from spark.session import get_spark
 
-RECOMPUTED = ["inst_name", "inst_kind", "is_onshore", "dist_m", "is_near_installation",
+RECOMPUTED = ["inst_id", "inst_name", "inst_kind", "is_onshore", "dist_m", "is_near_installation",
               "is_at_installation", "is_stationary", "dt", "hour"]
 
 

@@ -28,9 +28,15 @@ standby vessel can stay for weeks) is rebuilt from its own arrival, reading olde
 installation, so no visit is cut in two and the other, final visits on those days are kept as published. Recomputed days
 are written to gold/_staging/<run>, checked against Silver for the same days, then swapped in one day at a time;
 days older than lookback_days are dropped. --full (and the first run on unpartitioned tables) rebuilds everything.
+KEYS: the installation key is Sodir's facility number (inst_id). Every Silver row is mapped to the CURRENT name of its
+number before any table is built (rows written before Silver stored the number get it from their name), so a renamed
+installation keeps one history; when the numbers or names in the facility list change, the next run is a full rebuild.
+Every recomputed table is checked for repeated keys (KEYS; a full run checks its newest days, so the check stays
+cheap), and the installations dimension for repeated inst_id and inst_name. Repeats are a WARNING, not a gate check:
+Gold still publishes, and the warning is printed to the Gold log and stored in _READY.json and the trace.
 On failure the previous Gold stays untouched, gold/_LAST_FAILED.json is written and the process exits non-zero.
 """
-import argparse, json, os, shutil, sys, uuid
+import argparse, hashlib, json, os, shutil, sys, uuid
 from datetime import datetime, timedelta, timezone
 from pyspark import StorageLevel
 from pyspark.sql import functions as F
@@ -40,15 +46,19 @@ import pipeline_config
 from spark import gold_plan as plan
 from spark.gold_logic import (build_ais_gaps, build_coverage, build_hourly, build_installations, build_loitering,
                               build_vessel_days, build_vessels, build_visits, build_zone_entries, covered_hours,
-                              build_vessel_tracks, with_position_flags, flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
+                              build_vessel_tracks, conform_installations, duplicate_keys, with_position_flags, flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
                               mark_worth_a_look)
 from spark.session import get_spark
 
 PARTITIONED = ("vessel_visits", "installation_activity_hourly", "vessel_days",
                "zone_entries", "loitering_events", "ais_gap_events", "feed_coverage_hourly", "vessel_tracks", "helicopter_landings")
-LAYOUT = "dt-partitioned-v7"      # bump when tables are added or change shape: the next run is then a full rebuild
+LAYOUT = "dt-partitioned-v8"      # bump when tables are added or change shape: the next run is then a full rebuild
 REBUILT_FROM_OPEN_VISITS = {"vessel_visits": "arrival_ts", "zone_entries": "entry_ts", "loitering_events": "start_ts"}
 DIMENSIONS = ("vessels", "installations")
+KEYS = {"vessel_visits": ["mmsi", "inst_name", "arrival_ts"], "installation_activity_hourly": ["inst_name", "hour_ts"],
+        "vessel_days": ["mmsi", "dt"], "vessel_tracks": ["mmsi", "slot_ts"], "zone_entries": ["mmsi", "inst_name", "entry_ts"],
+        "loitering_events": ["mmsi", "inst_name", "start_ts"], "ais_gap_events": ["mmsi", "end_ts"],
+        "feed_coverage_hourly": ["hour_ts"], "helicopter_landings": ["mmsi", "inst_name", "arrival_ts"]}
 
 
 def silver_reject_rate(cfg, path, lookback_days):
@@ -108,6 +118,12 @@ def main(full=False):
     if cfg.get("gold_shuffle_partitions"):
         spark.conf.set("spark.sql.shuffle.partitions", str(cfg["gold_shuffle_partitions"]))
 
+    # ---- installation key: Sodir's number; a change in the numbers or names means a full rebuild ----------
+    from spark.common import load_facilities
+    inst_ref = load_facilities(spark, cfg, P("bronze/reference/facilities.csv")).select("inst_id", "inst_name").cache()
+    pairs = sorted((r["inst_id"], r["inst_name"]) for r in inst_ref.where("inst_id IS NOT NULL").collect())
+    names_hash = hashlib.sha1(json.dumps(pairs, default=str).encode()).hexdigest()[:16]
+
     # ---- plan: which days to recompute -------------------------------------------------------------------
     _sp = obs.start("gold.plan")
     day_mtimes = plan.silver_day_mtimes(P("silver/positions"))
@@ -117,7 +133,7 @@ def main(full=False):
     window_start = max_dt - timedelta(days=cfg["lookback_days"] - 1)
     state = plan.read_json(P("gold/_state.json")) or {}
     last_ok = state.get("last_success_epoch")
-    full = bool(full or last_ok is None or state.get("layout") != LAYOUT
+    full = bool(full or last_ok is None or state.get("layout") != LAYOUT or state.get("installation_names") != names_hash
                 or not all(os.path.isdir(P(f"gold/{t}")) for t in PARTITIONED + DIMENSIONS))
     open_visits = None
     if full:
@@ -141,7 +157,8 @@ def main(full=False):
     _sp.end()
 
     # ---- read Silver: every row from S; before S only the rows of the visits still open at S ---------------
-    base = with_position_flags(spark.read.option("mergeSchema", "true").parquet(P("silver/positions")))
+    base = conform_installations(with_position_flags(spark.read.option("mergeSchema", "true").parquet(P("silver/positions"))),
+                                 inst_ref)
     raw = base.where((F.col("dt") >= F.lit(s_day)) & (F.col("dt") <= F.lit(max_dt)))
     if full:      # whole window: Silver already dedupes across batches, so skip the full-table shuffle
         read, raw_n = raw, None
@@ -258,6 +275,25 @@ def main(full=False):
         warnings.append(f"speed glitches (> {cfg.get('max_ship_kn', 50)} kn, nulled) are {gr:.4%} of {gr_n} positions in the "
                         f"last 24 h, above {gate.get('max_sog_glitch_rate', 0.001):.2%}: check the feed or a faulty transponder")
 
+    # ---- keys: every recomputed table should be unique on its key (a full run checks its newest days only) ---
+    _sp = obs.start("gold.keys")
+    check_from = s_day if not full else max(window_start, max_dt - timedelta(days=cfg.get("gold_recent_days", 2) - 1))
+    recomputed = {"vessel_visits": visits_new, "installation_activity_hourly": hourly, "vessel_days": vdays,
+                  "vessel_tracks": tracks, "zone_entries": zones_new, "loitering_events": loiter_new,
+                  "ais_gap_events": gaps, "feed_coverage_hourly": coverage, "helicopter_landings": landings}
+    dups = {t: duplicate_keys(df.where(F.col("dt") >= F.lit(check_from)), KEYS[t]) for t, df in recomputed.items()}
+    inst_dim = build_installations(spark, cfg, P("bronze/reference/facilities.csv")).cache()
+    dups["installations"] = (duplicate_keys(inst_dim.where("inst_id IS NOT NULL"), ["inst_id"])
+                             + duplicate_keys(inst_dim, ["inst_name"]))
+    _sp.end()
+    repeated = {t: n for t, n in dups.items() if n}
+    if repeated:     # a warning, not a gate check: Gold still publishes, the log, _READY.json and the trace say where
+        warnings.append(f"repeated keys from {check_from}: " + ", ".join(f"{t}={n}" for t, n in repeated.items())
+                        + "; run scripts/check_keys.py to see them")
+    if raw_n is not None and raw_n - (s["n"] or 0) > 0:
+        warnings.append(f"Silver held {raw_n - s['n']} duplicate (mmsi, event_ts) rows from {s_day}; Gold removed them, "
+                        "but Silver's own deduplication should have: check the left_anti step in silver_job")
+
     # ---- quality gate: every recomputed table must reconcile with Silver for the same days ---------------
     checks = []
     def chk(name, ok, detail):
@@ -285,6 +321,7 @@ def main(full=False):
     chk("no_negative_durations_or_null_keys", (v["neg"] or 0) == 0 and (v["nullkeys"] or 0) == 0, f"neg={v['neg']} nullkeys={v['nullkeys']}")
     ok = all(c["passed"] for c in checks)
 
+    manifest_keys = {"check_from": str(check_from), "repeated_keys": dups}
     manifest = {"run_id": run_id, "env": cfg["env"], "mode": "full" if full else "incremental",
                 "recompute_from": str(s_day), "visits_from": str(v_day), "newest_day": str(max_dt),
                 "silver_rows": n_s, "silver_rows_before_dedupe": raw_n,
@@ -295,7 +332,7 @@ def main(full=False):
                                "zone_entries": z["n"], "loitering_events": lo["n"], "ais_gap_events": g["n"],
                                "vessel_tracks": tr["n"], "helicopter_landings": hl["n"]},
                 "events_worth_a_look_recomputed": flags, "aircraft_rows": s["aircraft_rows"], "sog_glitches": s["glitches"],
-                "sog_glitch_rate_24h": gr, "warnings": warnings, "checks": checks}
+                "sog_glitch_rate_24h": gr, "keys": manifest_keys, "warnings": warnings, "checks": checks}
     for w in warnings:
         obs.event("warning", detail=w); print("WARNING:", w)
     obs.annotate(run_id=run_id, silver_rows=n_s, vessel_visits=v["n"], hourly_rows=h["n"], gate_passed=ok,
@@ -331,7 +368,7 @@ def main(full=False):
     flag_facility(build_vessels(spark.read.parquet(P("gold/vessel_days")) if plan.has_data(P("gold/vessel_days"))
                                 else vdays, sc.get("faulty_speed_min_count", 10), sc.get("faulty_speed_min_share", 0.01)),
                   fac_names, "name").write.mode("overwrite").parquet(f"{stage}/vessels")
-    build_installations(spark, cfg, P("bronze/reference/facilities.csv")).write.mode("overwrite").parquet(f"{stage}/installations")
+    inst_dim.write.mode("overwrite").parquet(f"{stage}/installations")
     for t in DIMENSIONS:
         plan.swap_dir(f"{stage}/{t}", P(f"gold/{t}"))
     shutil.rmtree(P("gold/_staging"), ignore_errors=True)
@@ -342,7 +379,7 @@ def main(full=False):
     manifest.update(status="READY", tables=tables, finished_at=datetime.now(timezone.utc).isoformat())
     json.dump(manifest, open(P("gold/_READY.json"), "w"), indent=2)
     json.dump({"last_success_epoch": started.timestamp(), "last_success_at": started.isoformat(), "run_id": run_id,
-               "layout": LAYOUT},
+               "layout": LAYOUT, "installation_names": names_hash},
               open(P("gold/_state.json"), "w"), indent=2)
     print(json.dumps(manifest, indent=2))
     try:                                            # pipeline loitering reads the published tracks; never fails Gold

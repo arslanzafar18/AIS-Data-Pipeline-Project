@@ -7,6 +7,7 @@
   "shuffle_partitions": 8,
   "facility_name_col": "facName",
   "facility_kind_col": "facKind",
+  "facility_id_col": "idFacility",
   "near_m": 5000,
   "at_m": 500,
   "near_m_onshore": 1500,

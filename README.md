@@ -50,6 +50,8 @@ ls data/prod/gold/_LAST_FAILED.json 2>/dev/null       # present = last Gold run 
    BarentsWatch credentials or the stream being down). `sudo systemctl restart ais-collector`.
 2. *Gold not READY*: read `data/prod/gold/_LAST_FAILED.json` (which gate check failed) and `tail -50 logs/gold_prod.log`.
    The previous Gold stays published, so readers are unaffected; fix the cause, the next hourly run publishes again.
+   *Warning "repeated keys"* in `logs/gold_prod.log` or `_READY.json` (`warnings`, `keys`): Gold still published; run
+   `APP_ENV=prod PYTHONPATH=. python scripts/check_keys.py` (read-only) to see which table repeats a key.
 3. *Gold too old*: `pgrep -af spark.gold_job` (a run still going?) and `free -g` (out of memory → see `docs/DESIGN_AND_LIMITS.md`).
 4. *Disk almost full* (under 15% free): `du -sh data/prod/*/* | sort -h | tail`; delete old `silver/positions_old_*` copies,
    or run retention with fewer days (`scripts/bronze_retention.py --days 14 --apply`).

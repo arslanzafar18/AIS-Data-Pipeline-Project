@@ -95,8 +95,9 @@ for b in sorted(buckets):
 
 ref = ROOT / "bronze/reference"; ref.mkdir(parents=True, exist_ok=True)
 with open(ref / "facilities.csv", "w", newline="") as f:
-    w = csv.writer(f); w.writerow(["fclName", "fclKind", "centroid_lat", "centroid_lon", "_source", "_ingest_ts"])
-    for n, k, la, lo in INST: w.writerow([n, k, la, lo, "SYNTHETIC_DEMO", BASE.isoformat()])
+    w = csv.writer(f); w.writerow(["fclNpdidFacility", "fclName", "fclKind", "centroid_lat", "centroid_lon", "_source", "_ingest_ts"])
+    for i, (n, k, la, lo) in enumerate(INST, start=1):
+        w.writerow([900000 + i, n, k, la, lo, "SYNTHETIC_DEMO", BASE.isoformat()])
 exp["files"] = len(buckets); exp["total_lines"] = sum(len(v) for v in buckets.values()); exp["visitors"] = 10
 (ROOT / "demo_expected.json").write_text(json.dumps(exp, indent=2))
 print(json.dumps(exp))
