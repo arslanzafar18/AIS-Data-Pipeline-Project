@@ -584,6 +584,7 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
       <dl class="defs">
         <dt>Visit</dt><dd>A vessel within 5 km of an offshore installation (1.5 km for onshore terminals). 30 minutes without a position starts a new visit.</dd>
         <dt>Service call</dt><dd>A visit that came inside the installation's 500 m safety zone. Only vessels with permission may enter the zone, so entering it is a good sign of supply, standby or crew work. It is inferred from positions: the data does not say what the work was.</dd>
+        <dt>Installation transmitters</dt><dd>Platforms, FPSOs and rigs that broadcast AIS under their own Sodir name are not vessels serving anyone, so they are left out of this tab.</dd>
         <dt>Passing visit</dt><dd>A visit that stayed outside 500 m: usually a ship sailing past.</dd>
         <dt>Waiting</dt><dd>Time within 5 km before entering the 500 m zone, for example waiting for permission, the crane or the weather. Long waits point to queues or delays.</dd>
         <dt>Alongside</dt><dd>Time inside the 500 m zone, where the work happens. Long times point to heavy jobs or standby duty.</dd>
@@ -623,7 +624,7 @@ footer{color:var(--muted);font-size:.8125rem;margin-top:20px;max-width:80ch}
           <b>High</b>: 80 m or longer at over 10 kn, or 24 to 80 m at over 15 kn. <b>Medium</b>: 24 to 80 m at 10 to 15 kn, or length unknown.
           <b>Low</b>: under 24 m, or a rescue craft. These thresholds are this dashboard's own judgement, not an industry standard.</dd>
         <dt>Rescue craft</dt><dd>A fast rescue boat or daughter craft launched from a standby vessel for drills, crew transfers and call-outs: AIS type "search and rescue" under 24 m, or a name containing FRB, FRC, MOB, DC (with or without a number) or DAUGHTER. They are built to run at 25 to 30 kn, so they rank as low risk.</dd>
-        <dt>Offshore fleet</dt><dd>Vessels that entered the 500 m zone of at least 2 different offshore installations, or at least 5 times in total, or made at least 10 visits within 5 km of offshore installations, in the whole data period. Supply, standby, diving and crew vessels fall in this group whatever ship type their AIS reports (many supply vessels report "cargo").</dd>
+        <dt>Offshore fleet</dt><dd>Vessels that entered the 500 m zone of at least 2 different offshore installations, or at least 5 times in total, or made at least 10 visits within 5 km of offshore installations, or spent at least 48 hours in total within 5 km of them (standby and field vessels that wait outside the zone), or stayed at least 1 hour inside the zone of the same installation on 2 or more different days (a supply vessel serving one field), in the whole data period. A vessel that only meets the last rule but has no business there still shows on the Surveillance tab as loitering. Supply, standby, diving and crew vessels fall in this group whatever ship type their AIS reports (many supply vessels report "cargo").</dd>
         <dt>Unexpected entry</dt><dd>An entry into an offshore installation's 500 m zone by a fishing vessel, or by a vessel outside the offshore fleet: a ship that almost never comes inside any safety zone.</dd>
         <dt>Fishing vessel</dt><dd>Registered in the Norwegian fishing vessel register (Fiskeridirektoratet, matched on radio call sign), or reporting AIS ship type "fishing". Foreign fishing vessels are only found by their AIS type, and boats under 15 m often carry no AIS.</dd>
         <dt>Vessel presence</dt><dd>The share of hours with at least one vessel within 5 km of an offshore installation. Hours when the whole feed was thin are left out. Offshore Norge guideline 064 sets rescue times (a person overboard picked up within 8 min; a ditched helicopter or evacuation to sea rescued within 120 min) but no fixed distance for standby vessels, and one vessel often covers several installations. So presence is context, not a test of those requirements.</dd>
@@ -777,13 +778,15 @@ const SHIP = c => c == null ? '–' : c === 30 ? 'fishing' : c >= 31 && c <= 32 
   : c === 52 ? 'tug' : c === 53 ? 'port tender' : c === 55 ? 'law enforcement' : c >= 60 && c < 70 ? 'passenger' : c >= 70 && c < 80 ? 'cargo'
   : c >= 80 && c < 90 ? 'tanker' : c >= 90 && c < 100 ? 'other (often offshore supply)' : 'code ' + c;
 let sel = null;                                       // index into I of the picked installation, or null for all
+const isFac = m => !!(VES[m] && VES[m][3]);          // an installation broadcasting AIS itself (Gold: vessels.is_facility)
 function pick(ii){ sel = ii; $('iq').value = ii == null ? '' : I[ii][0]; render();
   const M = maps[tab === 'safety' ? 'mapZ' : 'mapT']; if (ii != null && M && M.markers[I[ii][0]]) M.map.setView(M.markers[I[ii][0]].getLatLng(), 8); }
 function traffic(){
   if (sel != null && !keep(I[sel][2])) sel = null;
-  const per = new Map(), calls = [], passing = [];
+  const per = new Map(), calls = [], passing = [], facLeft = new Set();
   for (let k = 0; k < V.t.length; k++) {
     if (!inRange(V.t[k])) continue; const ii = V.i[k]; if (!keep(I[ii][2])) continue;
+    if (isFac(V.m[k])) { facLeft.add(V.m[k]); continue; }
     let p = per.get(ii); if (!p) { p = {calls:0, pass:0, ves:new Set(), a:[], w:[]}; per.set(ii, p); }
     const r = {ii, m:V.m[k], t:V.t[k], d:V.d[k], w:V.w ? V.w[k] : null, a:V.a ? V.a[k] : null};
     if (V.z[k]) { p.calls++; p.ves.add(r.m); if (r.a != null) p.a.push(r.a); if (r.w != null) p.w.push(r.w); calls.push(r); }
@@ -820,14 +823,17 @@ function traffic(){
     fit(M, pts); }
   // table: installations, or the vessels serving the picked one
   if (sel == null) {
-    $('hTable').textContent = 'Installations'; $('nTable').textContent = 'Click a row to pick an installation.';
+    $('hTable').textContent = 'Installations';
+    $('nTable').textContent = 'Click a row to pick an installation.' + (facLeft.size ? ' ' + num(facLeft.size) +
+      (facLeft.size === 1 ? ' installation broadcasting its own AIS is' : ' installations broadcasting their own AIS are') +
+      ' left out of these numbers (for example an FPSO sending its own name).' : '');
     table('tTraffic', inst, [['Installation', r => r.name], ['Type', r => (r.kind || '').toLowerCase() + (r.on ? ' (onshore)' : '')],
       ['Field', r => r.field || '–'], ['Service calls', r => num(r.calls), 1], ['Vessels serving', r => num(r.vessels), 1],
       ['Median alongside', r => dur(r.along), 1], ['Median wait', r => dur(r.wait), 1], ['Passing visits', r => num(r.pass), 1]], r => pick(r.ii));
   } else {
     const byV = new Map(), elsewhere = new Map();
     for (let k = 0; k < V.t.length; k++) {               // every installation, whatever the Offshore/Onshore switch shows
-      if (!V.z[k] || V.i[k] === sel || !inRange(V.t[k])) continue;
+      if (!V.z[k] || V.i[k] === sel || !inRange(V.t[k]) || isFac(V.m[k])) continue;
       let s = elsewhere.get(V.m[k]); if (!s) elsewhere.set(V.m[k], s = new Map()); s.set(V.i[k], (s.get(V.i[k]) || 0) + 1); }
     for (const r of C) { let v = byV.get(r.m); if (!v) byV.set(r.m, v = {m:r.m, n:0, a:0, w:[], last:-1}); v.n++; v.a += r.a || 0; if (r.w != null) v.w.push(r.w); v.last = Math.max(v.last, r.t); }
     const rows = [...byV.values()].sort((x, y) => y.n - x.n || y.a - x.a);
@@ -882,17 +888,23 @@ function risk(r){                            // [level 0 high .. 2 low, label, r
 }
 const fishReg = m => !!(VES[m] && VES[m][4]), fishAis = m => !!(VES[m] && VES[m][1] === 30), isFishing = m => fishReg(m) || fishAis(m);
 const FLEET = (() => {                       // zone entries per vessel at offshore installations over the whole data period
-  const n = new Map(), inst = new Map();
+  const n = new Map(), inst = new Map(), served = new Map();   // served: vessel -> installation -> days with >= 1 h inside
   for (let k = 0; k < Z.t.length; k++) { if (I[Z.i[k]][2]) continue; const m = Z.m[k];
-    n.set(m, (n.get(m) || 0) + 1); if (!inst.has(m)) inst.set(m, new Set()); inst.get(m).add(Z.i[k]); }
-  const near = new Map();                    // visits within 5 km of offshore installations
-  for (let k = 0; k < V.t.length; k++) if (!I[V.i[k]][2]) near.set(V.m[k], (near.get(V.m[k]) || 0) + 1);
-  return {n, inst, near, has: m => (inst.get(m) || new Set()).size >= 2 || (n.get(m) || 0) >= 5 || (near.get(m) || 0) >= 10};
+    n.set(m, (n.get(m) || 0) + 1); if (!inst.has(m)) inst.set(m, new Set()); inst.get(m).add(Z.i[k]);
+    if (Z.d[k] >= 60) { if (!served.has(m)) served.set(m, new Map()); const s = served.get(m);
+      if (!s.has(Z.i[k])) s.set(Z.i[k], new Set()); s.get(Z.i[k]).add(Math.floor(Z.t[k] / 24)); } }
+  const repeat = m => [...(served.get(m) || new Map()).values()].some(days => days.size >= 2);
+  const near = new Map(), mins = new Map();  // visits and minutes within 5 km of offshore installations
+  for (let k = 0; k < V.t.length; k++) if (!I[V.i[k]][2]) {
+    near.set(V.m[k], (near.get(V.m[k]) || 0) + 1); mins.set(V.m[k], (mins.get(V.m[k]) || 0) + (V.d[k] || 0)); }
+  const STANDBY_MIN = 48 * 60;               // two days near installations: a standby or field vessel at work
+  return {n, inst, near, mins, has: m => (inst.get(m) || new Set()).size >= 2 || (n.get(m) || 0) >= 5 ||
+                                         (near.get(m) || 0) >= 10 || (mins.get(m) || 0) >= STANDBY_MIN || repeat(m)};
 })();
 const fishSource = m => fishReg(m) ? 'fishing register' : fishAis(m) ? 'AIS type fishing' : '';
 const unexpectedWhy = m => isFishing(m) ? 'fishing vessel (' + fishSource(m) + ')'
   : 'rarely near installations: ' + (FLEET.n.get(m) || 0) + ' zone entries at ' + (FLEET.inst.get(m) || new Set()).size +
-    ' installation(s) and ' + (FLEET.near.get(m) || 0) + ' visits within 5 km in all data';
+    ' installation(s), ' + (FLEET.near.get(m) || 0) + ' visits and ' + dur(FLEET.mins.get(m) || 0) + ' within 5 km in all data';
 function zoneRows(filterMmsi){
   const rows = [];
   for (let k = 0; k < Z.t.length; k++) {
@@ -923,7 +935,7 @@ function safety(){
   const all = zoneRows(null), rows = sel == null ? all : all.filter(r => r.ii === sel), per = new Map();
   const isFast = r => r.kn != null && r.kn > R.fast_kn, fast = rows.filter(isFast).map(r => ({...r, risk: risk(r)}));
   const prior = earlierEntries();
-  const unexp = rows.filter(r => !r.on && !isRescue(r.m) && (isFishing(r.m) || !FLEET.has(r.m)))
+  const unexp = rows.filter(r => !r.on && !isRescue(r.m) && !isFac(r.m) && (isFishing(r.m) || !FLEET.has(r.m)))
                     .map(r => ({...r, before: prior.get(r.m + '|' + r.ii).filter(t => t < r.t).length}));
   const fishVisits = [];
   for (let k = 0; k < V.t.length; k++) { const ii = V.i[k];
