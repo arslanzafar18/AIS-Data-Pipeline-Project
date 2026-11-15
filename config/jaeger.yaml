@@ -1,0 +1,42 @@
+# Jaeger v2 configuration used in production (installed by scripts/install_jaeger.sh).
+# Traces are kept in memory (the latest 100,000; a restart clears them). Every endpoint is bound to localhost:
+# the Jaeger UI has no login, so it is reached through SSH / VS Code port forwarding, never from the internet.
+service:
+  extensions: [jaeger_storage, jaeger_query]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter]
+  telemetry:
+    metrics:
+      level: none          # no internal metrics server, so port 8888 is not needed
+
+extensions:
+  jaeger_storage:
+    backends:
+      memstore:
+        memory:
+          max_traces: 100000
+  jaeger_query:
+    storage:
+      traces: memstore
+    http:
+      endpoint: localhost:16686
+    grpc:
+      endpoint: localhost:16685
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: localhost:4317
+      http:
+        endpoint: localhost:4318
+
+processors:
+  batch:
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: memstore

@@ -3,10 +3,10 @@ Description=Jaeger (traces): OTLP on localhost:4318, UI on localhost:16686. No l
 After=network.target
 
 [Service]
-User=ubuntu
-WorkingDirectory=/home/ubuntu/jaeger
-# JAEGER_CMD is set by scripts/install_ops_services.sh from the Jaeger you already run (binary + config path).
-EnvironmentFile=/home/ubuntu/jaeger/jaeger.env
+User=@USER@
+WorkingDirectory=@JAEGER_DIR@
+# JAEGER_CMD (binary + config path) is written by scripts/install_jaeger.sh.
+EnvironmentFile=@JAEGER_DIR@/jaeger.env
 ExecStart=/bin/sh -c 'exec $JAEGER_CMD'
 Restart=always
 RestartSec=5

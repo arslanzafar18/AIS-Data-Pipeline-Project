@@ -3,8 +3,8 @@ Description=Serve the Gold dashboard on localhost:8050 (reach it through SSH por
 After=network.target
 
 [Service]
-User=ubuntu
-ExecStart=/usr/bin/python3 -m http.server 8050 --bind 127.0.0.1 --directory /home/ubuntu/AIS-Data-Pipeline-Project/data/prod/gold/dashboard
+User=@USER@
+ExecStart=/usr/bin/python3 -m http.server 8050 --bind 127.0.0.1 --directory @REPO@/data/prod/gold/dashboard
 Restart=always
 RestartSec=5
 
