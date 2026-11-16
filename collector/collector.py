@@ -42,6 +42,7 @@ def utcnow():
 
 
 def get_token():
+    """OAuth2 client-credentials token, and the time to renew it (2 minutes before it expires)."""
     r = requests.post(TOKEN_URL, data={
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
         "scope": "ais", "grant_type": "client_credentials"}, timeout=30)
@@ -83,26 +84,32 @@ def retry_wait(error, backoff):
     return backoff, min(backoff * 2, MAX_BACKOFF_SECONDS)
 
 
+def read_stream(resp, expiry):
+    """Append every line of one open stream to the buffer until it closes, we stop, or the token is about to
+    expire. Returns (why it ended, messages read)."""
+    n = 0
+    with resp:
+        for line in resp.iter_lines():
+            if stop.is_set():
+                return "stopping", n
+            if time.time() > expiry:
+                return "token_refresh", n       # reader() reconnects with a fresh token
+            if line:
+                n += 1
+                with lock:
+                    buffer.append((utcnow().isoformat(), line.decode("utf-8", "replace")))
+    return "stream_closed", n
+
+
 def reader():
-    """Connect, read lines, reconnect with backoff; refresh token before expiry."""
+    """Runs in its own thread: connect, read the stream, and reconnect after any failure with a growing wait."""
     backoff, attempt = 1, 0
     while not stop.is_set():
         attempt += 1
         try:
             resp, expiry = connect(attempt)
-            backoff, started, n, reason = 1, time.time(), 0, "stream_closed"
-            with resp:
-                for line in resp.iter_lines():
-                    if stop.is_set():
-                        reason = "stopping"
-                        break
-                    if time.time() > expiry:
-                        reason = "token_refresh"
-                        break           # outer loop reconnects with a fresh token
-                    if line:
-                        n += 1
-                        with lock:
-                            buffer.append((utcnow().isoformat(), line.decode("utf-8", "replace")))
+            backoff, started = 1, time.time()
+            reason, n = read_stream(resp, expiry)
             # A stream lasts up to an hour, so it is not one long span: a short span records how it ended.
             with obs.span("bronze.stream_end", reason=reason, messages=n,
                           duration_s=round(time.time() - started, 1), attempt=attempt):
@@ -111,7 +118,8 @@ def reader():
             wait, backoff = retry_wait(e, backoff)
             auth = is_auth_failure(e)
             log_event("reader_error", error=repr(e), backoff=wait, auth_failure=auth)
-            with obs.span("bronze.reader_error", error=repr(e)[:300], backoff_s=wait, attempt=attempt, auth_failure=auth):
+            with obs.span("bronze.reader_error", error=repr(e)[:300], backoff_s=wait, attempt=attempt,
+                          auth_failure=auth):
                 obs.mark_error(type(e).__name__)
             stop.wait(wait)             # unlike time.sleep, a shutdown does not have to wait out a long pause
 
@@ -123,13 +131,33 @@ def make_record(ingest_ts, line, file_name, run_id=None):
 
 
 def log_event(kind, **kw):
+    """One line in metrics/events.jsonl (start, flush, reader_error, stop); the health tab reads it."""
     METRICS_DIR.mkdir(parents=True, exist_ok=True)
     rec = {"ts": utcnow().isoformat(), "run_id": RUN_ID, "event": kind, **kw}
     with open(METRICS_DIR / "events.jsonl", "a") as f:
         f.write(json.dumps(rec) + "\n")
 
 
+def write_bronze_file(batch, window_end):
+    """Write one gzip JSONL file into bronze/raw/dt=YYYY-MM-DD/hour=HH/. It is written under a dot-name first
+    (Spark ignores dot-files) and renamed when complete, so Silver never reads half a file.
+    Returns (final path, raw bytes before compression)."""
+    d = BRONZE_DIR / f"dt={window_end:%Y-%m-%d}" / f"hour={window_end:%H}"
+    d.mkdir(parents=True, exist_ok=True)
+    name = f"ais_{RUN_ID}_{window_end:%Y%m%dT%H%M%SZ}.jsonl.gz"
+    tmp = d / f".tmp_{name}"
+    raw_bytes = 0
+    with gzip.open(tmp, "wt", encoding="utf-8") as f:
+        for ts, line in batch:
+            raw_bytes += len(line.encode("utf-8"))
+            f.write(json.dumps(make_record(ts, line, name), ensure_ascii=False) + "\n")
+    final = d / name
+    tmp.rename(final)
+    return final, raw_bytes
+
+
 def flush(window_start, window_end):
+    """Take everything buffered since the last flush and write it to Bronze (traced as one span)."""
     with obs.span("bronze.flush", source=SOURCE, run_id=RUN_ID):
         _flush(window_start, window_end)
 
@@ -139,33 +167,22 @@ def _flush(window_start, window_end):
         batch = buffer[:]
         buffer.clear()
     secs = (window_end - window_start).total_seconds()
-    if not batch:
+    if not batch:                       # logged too, so a quiet stream is visible on the health tab
         log_event("flush", file=None, messages=0, bytes_raw=0, bytes_gz=0, window_s=secs)
         obs.annotate(messages=0, window_s=secs)
         obs.event("empty_window")
         return
-    d = BRONZE_DIR / f"dt={window_end:%Y-%m-%d}" / f"hour={window_end:%H}"
-    d.mkdir(parents=True, exist_ok=True)
-    name = f"ais_{RUN_ID}_{window_end:%Y%m%dT%H%M%SZ}.jsonl.gz"
-    tmp = d / f".tmp_{name}"            # Spark ignores dot-files => no half-written reads
-    raw_bytes = 0
-    with gzip.open(tmp, "wt", encoding="utf-8") as f:
-        for ts, line in batch:
-            s = json.dumps(make_record(ts, line, name), ensure_ascii=False)
-            raw_bytes += len(line.encode("utf-8"))
-            f.write(s + "\n")
-    final = d / name
-    tmp.rename(final)
+    final, raw_bytes = write_bronze_file(batch, window_end)
     gz = final.stat().st_size
-    log_event("flush", file=str(final), messages=len(batch), bytes_raw=raw_bytes,
-              bytes_gz=gz, window_s=secs)
+    log_event("flush", file=str(final), messages=len(batch), bytes_raw=raw_bytes, bytes_gz=gz, window_s=secs)
     obs.annotate(messages=len(batch), bytes_raw=raw_bytes, bytes_gz=gz, window_s=secs,
-                 file=name, partition=f"dt={window_end:%Y-%m-%d}/hour={window_end:%H}")
-    (METRICS_DIR / "heartbeat.json").write_text(json.dumps(
-        {"ts": utcnow().isoformat(), "run_id": RUN_ID, "last_file": name, "messages": len(batch)}))
+                 file=final.name, partition=f"dt={window_end:%Y-%m-%d}/hour={window_end:%H}")
+    (METRICS_DIR / "heartbeat.json").write_text(json.dumps(       # read by the monitor's stale-heartbeat alert
+        {"ts": utcnow().isoformat(), "run_id": RUN_ID, "last_file": final.name, "messages": len(batch)}))
 
 
 def main():
+    """Start the reader thread, then cut a Bronze file at every FLUSH_SECONDS wall-clock boundary until stopped."""
     if not CLIENT_ID or not CLIENT_SECRET:
         sys.exit("Set BW_CLIENT_ID and BW_CLIENT_SECRET")
     BRONZE_DIR.mkdir(parents=True, exist_ok=True)

@@ -81,8 +81,8 @@ def test_rejected_requests_are_not_retried(monkeypatch, code, calls):
         seen.append(req.full_url)
         raise urllib.error.HTTPError(req.full_url, code, "refused", {}, None)
 
-    monkeypatch.setattr(fs.urllib.request, "urlopen", refuse)
-    monkeypatch.setattr(fs.time, "sleep", waits.append)
+    monkeypatch.setattr(fs.common.urllib.request, "urlopen", refuse)   # the retrying GET lives in reference/common.py
+    monkeypatch.setattr(fs.common.time, "sleep", waits.append)
     with pytest.raises(urllib.error.HTTPError):
         fs._json("https://example.invalid/layer")
     assert len(seen) == calls and waits == [5, 10, 20][:calls - 1]

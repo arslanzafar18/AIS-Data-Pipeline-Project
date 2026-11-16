@@ -18,9 +18,11 @@ Stdlib only.   Run:  APP_ENV=prod PYTHONPATH=. python reference/fetch_gfw_sar.py
 import sys
 from pathlib import Path as _P
 sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
-import argparse, csv, json, os, time, urllib.error, urllib.parse, urllib.request
+import argparse, json, os, time, urllib.error, urllib.parse, urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+from reference import common
 
 API = "https://gateway.api.globalfishingwatch.org/v3/4wings/report"
 DATASET = "public-global-sar-presence:latest"
@@ -81,20 +83,8 @@ def merge(old, new, keep_from):
     return sorted((r for r in by.values() if str(r["date"]) >= keep_from.isoformat()), key=lambda r: (str(r["date"]), str(r["lat"])))
 
 
-def read_csv(path):
-    if not os.path.exists(path):
-        return []
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-
 def write_csv_atomic(path, rows):
-    tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".tmp")
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=HEADER)
-        w.writeheader()
-        w.writerows(rows)
-    os.replace(tmp, path)
+    common.write_csv_atomic(path, rows, HEADER)
 
 
 def main(argv=None):
@@ -111,21 +101,29 @@ def main(argv=None):
     now = datetime.now(timezone.utc)
     end, start = now.date(), now.date() - timedelta(days=a.days)
     boxes = cfg.get("surveillance", {}).get("gfw_boxes", BOXES)
-    snap = P("bronze/gfw/sar") / f"ingest_date={now:%Y-%m-%d}"
-    snap.mkdir(parents=True, exist_ok=True)
-    new, limits = [], {}
-    for i, box in enumerate(boxes):
+
+    # 1. One request per sea area (box).
+    bodies, new, limits = [], [], {}
+    for box in boxes:
         body, limits = request(box, start, end, token)
-        (snap / f"box_{i:02d}.json").write_text(json.dumps(body), encoding="utf-8")
+        bodies.append(body)
         new += rows_from(body, now.isoformat())
     versions = sorted({r["dataset"] for r in new})
-    (snap / "_manifest.json").write_text(json.dumps(
-        {"source": API, "dataset": DATASET, "versions": versions, "date_range": [str(start), str(end)], "boxes": boxes,
-         "filter": "matched='false'", "spatial_resolution": "HIGH (0.01 deg)", "fetched_at": now.isoformat(), "cells": len(new),
-         "rate_limits": limits, "attribution": ATTRIBUTION, "licence": "CC BY-NC 4.0, non-commercial use only"}, indent=2),
-        encoding="utf-8")
+
+    # 2. Keep the raw responses in Bronze.
+    snap = P("bronze/gfw/sar") / f"ingest_date={now:%Y-%m-%d}"
+    common.save_snapshot(snap, bodies, {"source": API, "dataset": DATASET, "versions": versions,
+                                        "date_range": [str(start), str(end)], "boxes": boxes,
+                                        "filter": "matched='false'", "spatial_resolution": "HIGH (0.01 deg)",
+                                        "fetched_at": now.isoformat(), "cells": len(new), "rate_limits": limits,
+                                        "attribution": ATTRIBUTION,
+                                        "licence": "CC BY-NC 4.0, non-commercial use only"},
+                         name="box_{:02d}.json")
+
+    # 3. Merge into the stored detections (newest fetch wins) and drop days older than the lookback window.
     out = P("bronze/gfw/sar_detections.csv")
-    merged = merge(read_csv(out), new, date.today() - timedelta(days=int(cfg.get("lookback_days", 90))))
+    keep_from = date.today() - timedelta(days=int(cfg.get("lookback_days", 90)))
+    merged = merge(common.read_csv(out), new, keep_from)
     write_csv_atomic(str(out), merged)
     print(json.dumps({"fetched_at": now.isoformat(), "date_range": [str(start), str(end)], "new_cells": len(new),
                       "stored_cells": len(merged), "versions": versions,

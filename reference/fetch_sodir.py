@@ -15,14 +15,15 @@ Stdlib only.   Run:  APP_ENV=prod PYTHONPATH=. python reference/fetch_sodir.py
 import sys
 from pathlib import Path as _P
 sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
-import csv, json, math, os, time, urllib.error, urllib.parse, urllib.request
+import json, math, urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from reference import common
+
 LAYER_URL = "https://factmaps.sodir.no/api/rest/services/Factmaps/FactMapsWGS84/MapServer/307"
 PAGE = 1000
-MIN_ROW_RATIO = 0.8            # refuse to publish if the new list is < 80% of the previous one
 MOVE_M = 100                   # a facility "moved" if its position changed by more than this
 OSLO = ZoneInfo("Europe/Oslo")  # Sodir dates are midnight Oslo time, sent as epoch milliseconds
 
@@ -48,23 +49,7 @@ HEADER = [c for _, c in COLUMNS] + ["centroid_lon", "centroid_lat", "_source", "
 WATCH = ["facName", "facKind", "phaseName", "surface", "FixMov"]
 
 
-def _json(url, tries=4):
-    for k in range(tries):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ais-data-pipeline/1.0"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                d = json.load(r)
-            if "error" in d:
-                raise RuntimeError(f"API error: {d['error']}")
-            return d
-        except urllib.error.HTTPError as e:
-            if (400 <= e.code < 500 and e.code != 429) or k == tries - 1:   # a rejected request does not get better
-                raise
-            time.sleep(5 * 2 ** k)                                       # 429 or a server error: back off
-        except Exception:
-            if k == tries - 1:
-                raise
-            time.sleep(5 * 2 ** k)
+_json = common.get_json    # shared GET with retries (reference/common.py)
 
 
 def check_fields(fields):
@@ -145,61 +130,42 @@ def diff(old, new):
             "changed": changed}
 
 
-def read_csv(path):
-    if not os.path.exists(path):
-        return []
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-
 def write_csv_atomic(path, rows):
-    tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".tmp")
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=HEADER)
-        w.writeheader()
-        w.writerows(rows)
-    os.replace(tmp, path)
+    common.write_csv_atomic(path, rows, HEADER)
 
 
 def main():
     import pipeline_config
     cfg = pipeline_config.load()
     P = lambda rel: Path(pipeline_config.path(cfg, rel))
-    ref, now = P("bronze/reference"), datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     fetched_at = now.isoformat()
 
-    meta = _json(f"{LAYER_URL}?f=json")
-    fields = [f["name"] for f in meta.get("fields", [])]
+    # 1. Download, after checking the API still has the columns we rely on.
+    fields = [f["name"] for f in _json(f"{LAYER_URL}?f=json").get("fields", [])]
     check_fields(fields)
     pages = fetch_pages()
-
-    snap = ref / "sodir" / "facilities" / f"ingest_date={now:%Y-%m-%d}"
-    snap.mkdir(parents=True, exist_ok=True)
-    for old_page in snap.glob("page_*.json"):
-        old_page.unlink()
-    for i, p in enumerate(pages):
-        (snap / f"page_{i:03d}.json").write_text(json.dumps(p), encoding="utf-8")
     features = [f for p in pages for f in p.get("features", [])]
     rows = to_rows(features, LAYER_URL, fetched_at)
-    (snap / "_manifest.json").write_text(json.dumps(
-        {"source": LAYER_URL, "fetched_at": fetched_at, "pages": len(pages), "features": len(features),
-         "rows_with_position": len(rows), "fields": fields, "licence": "NLOD, Norwegian Offshore Directorate"},
-        indent=2), encoding="utf-8")
 
-    current = ref / "facilities.csv"
-    old = read_csv(current)
-    if old and len(rows) < MIN_ROW_RATIO * len(old):
-        raise SystemExit(f"Only {len(rows)} facilities vs {len(old)} last time; facilities.csv NOT replaced "
-                         f"(snapshot kept in {snap}).")
+    # 2. Keep the raw pages in Bronze.
+    snap = P("bronze/reference/sodir/facilities") / f"ingest_date={now:%Y-%m-%d}"
+    common.save_snapshot(snap, pages, {"source": LAYER_URL, "fetched_at": fetched_at, "pages": len(pages),
+                                       "features": len(features), "rows_with_position": len(rows), "fields": fields,
+                                       "licence": "NLOD, Norwegian Offshore Directorate"})
+
+    # 3. Refuse a list that shrank, then replace facilities.csv.
+    current = P("bronze/reference/facilities.csv")
+    old = common.read_csv(current)
+    common.refuse_if_shrunk(len(rows), len(old), "facilities", "facilities.csv", snap)
     changes = diff(old, rows) if old else {"added": [], "removed": [], "changed": []}
     write_csv_atomic(str(current), rows)
 
+    # 4. Log what changed since last week.
     summary = {"fetched_at": fetched_at, "rows": len(rows), "previous_rows": len(old), "snapshot": str(snap),
                "added": len(changes["added"]), "removed": len(changes["removed"]), "changed": len(changes["changed"]),
                "details": {k: v[:50] for k, v in changes.items()}}
-    qdir = P("quality"); qdir.mkdir(parents=True, exist_ok=True)
-    with open(qdir / "sodir_changes.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(summary) + "\n")
+    common.append_jsonl(P("quality/sodir_changes.jsonl"), summary)
     print(json.dumps({k: v for k, v in summary.items() if k != "details"}))
     for kind in ("added", "removed", "changed"):
         for item in changes[kind][:20]:
