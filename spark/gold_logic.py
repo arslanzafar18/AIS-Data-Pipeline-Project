@@ -105,6 +105,39 @@ def build_vessels(vessel_days: DataFrame, faulty_min_count: int = 10, faulty_min
                         & (F.col("sog_glitches") >= faulty_min_share * F.col("n_msgs")))
 
 
+def _call_sign(c):
+    """Radio call sign compared without case, spaces or dashes: 'lk-2345' -> 'LK2345'."""
+    return F.regexp_replace(F.upper(F.trim(c)), "[^A-Z0-9]", "")
+
+
+def match_fishing_register(vessels: DataFrame, register: DataFrame, length_tol_m: float = 3.0) -> DataFrame:
+    """Fishing vessels: the register has no MMSI, so a vessel is matched on its AIS call sign, then confirmed.
+    fishing_match = 'strong': call sign matches AND the name or the length (within length_tol_m) agrees;
+                    'weak':   call sign matches, but neither name nor length confirms it (a mistyped or reused call
+                              sign, or AIS without a name or length): still shown as fishing, marked unconfirmed;
+                    null:     not in the register.
+    fishing_vessel_id: the register's own key. One row out per vessel in (the best register row wins)."""
+    reg = (register.select(_call_sign(F.col("call_sign")).alias("_cs"), F.col("vessel_id").cast("string").alias("_rid"),
+                           _norm_name(F.col("name")).alias("_rn"), F.col("length_m").cast("double").alias("_rl"))
+                   .where(F.length("_cs") > 0))
+    j = vessels.withColumn("_cs", _call_sign(F.col("call_sign"))).join(F.broadcast(reg), "_cs", "left")
+    name_ok = F.coalesce((F.length("_rn") > 0) & (F.col("_rn") == _norm_name(F.col("name"))), F.lit(False))
+    len_ok = F.coalesce((F.col("length_m") > 0) & (F.abs(F.col("length_m") - F.col("_rl")) <= length_tol_m), F.lit(False))
+    j = j.withColumn("_score", F.when(F.col("_rid").isNotNull(), F.when(name_ok | len_ok, 2).otherwise(1)))
+    w = Window.partitionBy("mmsi").orderBy(F.col("_score").desc_nulls_last(),
+                                           F.abs(F.col("length_m") - F.col("_rl")).asc_nulls_last(), F.col("_rid"))
+    return (j.withColumn("_k", F.row_number().over(w)).where("_k = 1")
+             .withColumn("fishing_match", F.when(F.col("_score") == 2, "strong").when(F.col("_score") == 1, "weak"))
+             .withColumn("fishing_vessel_id", F.when(F.col("_score").isNotNull(), F.col("_rid")))
+             .drop("_cs", "_rid", "_rn", "_rl", "_score", "_k"))
+
+
+def no_fishing_register(vessels: DataFrame) -> DataFrame:
+    """Same columns as match_fishing_register when the register has not been fetched yet."""
+    return (vessels.withColumn("fishing_match", F.lit(None).cast("string"))
+                   .withColumn("fishing_vessel_id", F.lit(None).cast("string")))
+
+
 def build_installations(spark, cfg, path) -> DataFrame:
     """One row per installation in the facility filter, with its Sodir number (inst_id, the key), field, phase and
     position (from Bronze)."""

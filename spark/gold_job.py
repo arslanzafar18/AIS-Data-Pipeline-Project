@@ -4,7 +4,7 @@ Gold job: builds consumer tables from Silver and PUBLISHES THEM ONLY IF QUALITY 
   gold/vessel_visits                 one row per vessel visit to an installation        (partitioned by arrival day)
   gold/installation_activity_hourly  vessels / messages / speed per installation-hour   (partitioned by day)
   gold/vessel_days                   one row per vessel per day, from all positions     (partitioned by day)
-  gold/vessels                       one row per vessel: latest identity, first/last seen
+  gold/vessels                       one row per vessel: latest identity, first/last seen, fishing-register match
   gold/installations                 one row per installation in the facility filter, with field and position
   gold/zone_entries                  one row per entry into a 500 m safety zone                (by entry day)
   gold/loitering_events              slow (< loiter_max_kn) within 5 km for >= loiter_min_minutes (by start day)
@@ -47,7 +47,7 @@ from spark import gold_plan as plan
 from spark.gold_logic import (build_ais_gaps, build_coverage, build_hourly, build_installations, build_loitering,
                               build_vessel_days, build_vessels, build_visits, build_zone_entries, covered_hours,
                               build_vessel_tracks, conform_installations, duplicate_keys, with_position_flags, flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
-                              mark_worth_a_look)
+                              mark_worth_a_look, match_fishing_register, no_fishing_register)
 from spark.session import get_spark
 
 PARTITIONED = ("vessel_visits", "installation_activity_hourly", "vessel_days",
@@ -399,9 +399,18 @@ def main(full=False):
         else:
             plan.swap_partitions(f"{stage}/{t}", P(f"gold/{t}"), days.get(t, plan.days_between(s_day, max_dt)))
         plan.drop_partitions_before(P(f"gold/{t}"), window_start)
-    flag_facility(build_vessels(spark.read.parquet(P("gold/vessel_days")) if plan.has_data(P("gold/vessel_days"))
-                                else vdays, sc.get("faulty_speed_min_count", 10), sc.get("faulty_speed_min_share", 0.01)),
-                  fac_names, "name").write.mode("overwrite").parquet(f"{stage}/vessels")
+    vessels = flag_facility(build_vessels(spark.read.parquet(P("gold/vessel_days")) if plan.has_data(P("gold/vessel_days"))
+                                          else vdays, sc.get("faulty_speed_min_count", 10), sc.get("faulty_speed_min_share", 0.01)),
+                            fac_names, "name")
+    reg_path = P("bronze/reference/fishing_vessels.csv")        # fishing register: matched here, read by the dashboard
+    if os.path.exists(reg_path):
+        reg = spark.read.option("header", True).option("escape", '"').csv(reg_path)
+        vessels = match_fishing_register(vessels, reg, sc.get("fishing_length_tol_m", 3.0))
+    else:
+        vessels = no_fishing_register(vessels)
+    vessels.write.mode("overwrite").parquet(f"{stage}/vessels")
+    fm = {r["fishing_match"]: r["count"] for r in spark.read.parquet(f"{stage}/vessels").groupBy("fishing_match").count().collect()}
+    manifest["fishing_register"] = {"loaded": os.path.exists(reg_path), "strong": fm.get("strong", 0), "weak": fm.get("weak", 0)}
     inst_dim.write.mode("overwrite").parquet(f"{stage}/installations")
     for t in DIMENSIONS:
         plan.swap_dir(f"{stage}/{t}", P(f"gold/{t}"))

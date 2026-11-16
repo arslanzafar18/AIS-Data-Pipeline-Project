@@ -185,7 +185,7 @@ def _jsonl(path):
 
 
 SAR_COLUMNS = ["date", "lat", "lon", "detections", "dataset", "fetched_at"]          # read by read_sar
-FISHING_COLUMNS = ["call_sign"]                                                    # read by load_fishing_call_signs
+FISHING_COLUMNS = ["vessel_id", "call_sign", "name", "length_m"]                 # read by Gold (match_fishing_register)
 
 
 def reference_columns(files):
@@ -352,11 +352,14 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=No
     ves = {}
     if vessels is not None:
         fish = fishing_call_signs or set()
+        in_gold = "fishing_match" in vessels.columns     # Gold matched the register (call sign confirmed by name/length)
         for r in vessels.select("mmsi", _col(vessels, "name").alias("name"), _col(vessels, "ship_type").alias("st"),
-                                _col(vessels, "call_sign").alias("cs"),
+                                _col(vessels, "call_sign").alias("cs"), _col(vessels, "fishing_match").alias("fm"),
                                 _col(vessels, "length_m").alias("len"), _col(vessels, "is_facility").alias("fac")).collect():
             if r["mmsi"] in seen:
-                ves[str(r["mmsi"])] = [r["name"], r["st"], r["len"], bool(r["fac"]), int(norm_call_sign(r["cs"]) in fish)]
+                # 2 = register, confirmed; 1 = register, call sign only (unconfirmed); 0 = not in the register
+                reg = {"strong": 2, "weak": 1}.get(r["fm"], 0) if in_gold else (1 if norm_call_sign(r["cs"]) in fish else 0)
+                ves[str(r["mmsi"])] = [r["name"], r["st"], r["len"], bool(r["fac"]), reg]
     return {
         "t0": t0, "end": end, "buckets": [b[1] for b in BUCKETS],
         "inst": [[n, names[n][0], names[n][1], None, None, None] for n in order],
@@ -948,7 +951,7 @@ const FLEET = (() => {                       // zone entries per vessel at offsh
   return {n, inst, near, mins, has: m => (inst.get(m) || new Set()).size >= 2 || (n.get(m) || 0) >= 5 ||
                                          (near.get(m) || 0) >= 10 || (mins.get(m) || 0) >= STANDBY_MIN || repeat(m)};
 })();
-const fishSource = m => fishReg(m) ? 'fishing register' : fishAis(m) ? 'AIS type fishing' : '';
+const fishSource = m => fishReg(m) ? (VES[m][4] === 1 ? 'fishing register, call sign only' : 'fishing register') : fishAis(m) ? 'AIS type fishing' : '';
 const unexpectedWhy = m => isFishing(m) ? 'fishing vessel (' + fishSource(m) + ')'
   : 'rarely near installations: ' + (FLEET.n.get(m) || 0) + ' zone entries at ' + (FLEET.inst.get(m) || new Set()).size +
     ' installation(s), ' + (FLEET.near.get(m) || 0) + ' visits and ' + dur(FLEET.mins.get(m) || 0) + ' within 5 km in all data';
@@ -1027,7 +1030,7 @@ function safety(){
     ['Top speed', r => r.kn == null ? '–' : r.kn.toFixed(1) + ' kn', 1], ['Earlier entries here', r => r.before ? num(r.before) : 'first time', 1],
     ['Why unexpected', r => unexpectedWhy(r.m)]], r => pick(r.ii));
   $('nFish').textContent = 'Visits by fishing vessels within 5 km of offshore installations, newest first. ' + (D.fishing_register
-    ? 'Norwegian vessels are identified from the fishing vessel register; others by AIS type.' : 'The fishing vessel register is not loaded yet, so only AIS type "fishing" is used.');
+    ? 'Norwegian vessels are identified from the fishing vessel register by call sign, confirmed by name or length ("call sign only" = not confirmed); others by AIS type.' : 'The fishing vessel register is not loaded yet, so only AIS type "fishing" is used.');
   table('tFish', fishVisits.sort((a, b) => b.t - a.t), [['Vessel', r => vlink(r.m)], ['Identified by', r => fishSource(r.m)], ['Length', len, 1],
     ['Installation', r => r.inst], ['Arrived (UTC)', r => at(r.t)], ['Stayed', r => dur(r.d), 1], ['Inside 500 m', r => r.z ? 'yes' : 'no']], r => pick(r.ii));
 }
