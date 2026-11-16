@@ -18,14 +18,16 @@ Stdlib only.   Run:  APP_ENV=prod PYTHONPATH=. python reference/fetch_fishing_ve
 import sys
 from pathlib import Path as _P
 sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
-import csv, json, os, time, urllib.error, urllib.parse, urllib.request
+import json, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from reference import common
+from reference.common import MIN_ROW_RATIO
 
 API = "https://api.fiskeridir.no/vessel-api/api/v1/vessels"
 PAGE_SIZES = (500, 200, 100, 50, 30)   # the API rejects pages that are too large (HTTP 400); the first size it accepts is used
 MAX_PAGES = 1000
-MIN_ROW_RATIO = 0.8
 NEEDED = ["id", "radioCallSign", "name", "length"]
 HEADER = ["vessel_id", "call_sign", "name", "registration_mark", "length_m", "build_year", "_source", "_ingest_ts"]
 
@@ -99,29 +101,18 @@ def check_fields(items):
         raise SystemExit(f"Vessel API fields changed: need {NEEDED}, got {sorted(items[0])}. fishing_vessels.csv NOT replaced.")
 
 
-def read_csv(path):
-    if not os.path.exists(path):
-        return []
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-
 def write_csv_atomic(path, rows):
-    tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".tmp")
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=HEADER)
-        w.writeheader()
-        w.writerows(rows)
-    os.replace(tmp, path)
+    common.write_csv_atomic(path, rows, HEADER)
 
 
 def main():
     import pipeline_config
     cfg = pipeline_config.load()
     P = lambda rel: Path(pipeline_config.path(cfg, rel))
-    ref, now = P("bronze/reference"), datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     fetched_at = now.isoformat()
 
+    # 1. Download and drop personal data (owners) before anything is stored.
     pages, total = fetch_pages()
     print(f"fetched {sum(len(p) for p in pages)} vessels in {len(pages)} pages (reported total {total})")
     pages = [strip_personal(p) for p in pages]
@@ -129,30 +120,28 @@ def main():
     check_fields(items)
     if total is not None and len(items) < MIN_ROW_RATIO * total:
         raise SystemExit(f"Got {len(items)} of {total} vessels the API reports; fishing_vessels.csv NOT replaced.")
-
-    snap = ref / "fiskeridir" / "vessels" / f"ingest_date={now:%Y-%m-%d}"
-    snap.mkdir(parents=True, exist_ok=True)
-    for old_page in snap.glob("page_*.json"):
-        old_page.unlink()
-    for i, p in enumerate(pages):
-        (snap / f"page_{i:03d}.json").write_text(json.dumps(p), encoding="utf-8")
     rows = to_rows(items, API, fetched_at)
-    (snap / "_manifest.json").write_text(json.dumps(
-        {"source": API, "fetched_at": fetched_at, "pages": len(pages), "vessels": len(items), "reported_total": total,
-         "with_call_sign": sum(1 for r in rows if r["call_sign"]), "removed_fields": ["owners"],
-         "publisher": "Fiskeridirektoratet (Norwegian Directorate of Fisheries)"}, indent=2), encoding="utf-8")
+    with_call_sign = sum(1 for r in rows if r["call_sign"])
 
-    current = ref / "fishing_vessels.csv"
-    old = read_csv(current)
-    if old and len(rows) < MIN_ROW_RATIO * len(old):
-        raise SystemExit(f"Only {len(rows)} vessels vs {len(old)} last time; fishing_vessels.csv NOT replaced (snapshot in {snap}).")
-    o, n = {r["vessel_id"] for r in old}, {str(r["vessel_id"]) for r in rows}
+    # 2. Keep the raw pages in Bronze.
+    snap = P("bronze/reference/fiskeridir/vessels") / f"ingest_date={now:%Y-%m-%d}"
+    common.save_snapshot(snap, pages, {"source": API, "fetched_at": fetched_at, "pages": len(pages),
+                                       "vessels": len(items), "reported_total": total,
+                                       "with_call_sign": with_call_sign, "removed_fields": ["owners"],
+                                       "publisher": "Fiskeridirektoratet (Norwegian Directorate of Fisheries)"})
+
+    # 3. Refuse a list that shrank, then replace fishing_vessels.csv.
+    current = P("bronze/reference/fishing_vessels.csv")
+    old = common.read_csv(current)
+    common.refuse_if_shrunk(len(rows), len(old), "vessels", "fishing_vessels.csv", snap)
     write_csv_atomic(str(current), rows)
-    summary = {"fetched_at": fetched_at, "vessels": len(rows), "with_call_sign": sum(1 for r in rows if r["call_sign"]),
-               "previous": len(old), "added": len(n - o) if old else 0, "removed": len(o - n) if old else 0, "snapshot": str(snap)}
-    qdir = P("quality"); qdir.mkdir(parents=True, exist_ok=True)
-    with open(qdir / "fishing_register_changes.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(summary) + "\n")
+
+    # 4. Log how many vessels joined or left the register.
+    o, n = {r["vessel_id"] for r in old}, {str(r["vessel_id"]) for r in rows}
+    summary = {"fetched_at": fetched_at, "vessels": len(rows), "with_call_sign": with_call_sign,
+               "previous": len(old), "added": len(n - o) if old else 0, "removed": len(o - n) if old else 0,
+               "snapshot": str(snap)}
+    common.append_jsonl(P("quality/fishing_register_changes.jsonl"), summary)
     print(json.dumps(summary))
 
 

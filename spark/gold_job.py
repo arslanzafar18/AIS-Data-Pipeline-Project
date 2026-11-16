@@ -44,6 +44,7 @@ Gold still publishes, and the warning is printed to the Gold log and stored in _
 On failure the previous Gold stays untouched, gold/_LAST_FAILED.json is written and the process exits non-zero.
 """
 import argparse, hashlib, json, os, shutil, sys, uuid
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pyspark import StorageLevel
 from pyspark.sql import functions as F
@@ -196,7 +197,8 @@ def build_dashboard(spark, cfg, P, manifest):
         print(f"dashboard not updated: {e!r}")
 
 
-def main(full=False):
+def start_run(run):
+    """Load the config and start Spark; the run's id and start time go into the manifest."""
     cfg = pipeline_config.load()
     cfg["lookback_days"] = int(os.environ.get("GOLD_LOOKBACK_DAYS", cfg["lookback_days"]))
     P = lambda rel: pipeline_config.path(cfg, rel)
@@ -206,14 +208,26 @@ def main(full=False):
     spark = get_spark(cfg, "gold")
     if cfg.get("gold_shuffle_partitions"):
         spark.conf.set("spark.sql.shuffle.partitions", str(cfg["gold_shuffle_partitions"]))
+    run.P, run.cfg, run.gate, run.run_id = P, cfg, gate, run_id
+    run.spark, run.started = spark, started
 
-    # ---- installation key: Sodir's number; a change in the numbers or names means a full rebuild ----------
+
+def installation_key(run):
+    """Sodir's facility numbers and names. If they changed since the last run, Gold rebuilds in full,
+    so a renamed installation keeps one history."""
+    P, cfg, spark = run.P, run.cfg, run.spark
     from spark.common import load_facilities
     inst_ref = load_facilities(spark, cfg, P("bronze/reference/facilities.csv")).select("inst_id", "inst_name").cache()
     pairs = sorted((r["inst_id"], r["inst_name"]) for r in inst_ref.where("inst_id IS NOT NULL").collect())
     names_hash = hashlib.sha1(json.dumps(pairs, default=str).encode()).hexdigest()[:16]
+    run.inst_ref, run.names_hash = inst_ref, names_hash
 
-    # ---- plan: which days to recompute -------------------------------------------------------------------
+
+def plan_days(run):
+    """Which days to rebuild: the last few days plus any older day whose Silver changed (incremental),
+    or the whole window (full). Visits still open at the first rebuilt day are rebuilt from their arrival."""
+    P, cfg, full, names_hash = run.P, run.cfg, run.full, run.names_hash
+    spark = run.spark
     _sp = obs.start("gold.plan")
     day_mtimes = plan.silver_day_mtimes(P("silver/positions"))
     if not day_mtimes:
@@ -244,8 +258,16 @@ def main(full=False):
         v_day = max(window_start, first) if first is not None else s_day
     obs.annotate(mode="full" if full else "incremental", recompute_from=str(s_day), visits_from=str(v_day))
     _sp.end()
+    run.full, run.max_dt, run.open_visits, run.s_day = full, max_dt, open_visits, s_day
+    run.v_day, run.window_start = v_day, window_start
 
-    # ---- read Silver: every row from S; before S only the rows of the visits still open at S ---------------
+
+def read_silver(run):
+    """Read Silver for the rebuilt days, plus the older rows of visits still open, and build the tables
+    that need only positions: visits, hourly activity, vessel days, feed coverage and tracks."""
+    P, cfg, full, inst_ref = run.P, run.cfg, run.full, run.inst_ref
+    max_dt, open_visits, s_day, spark = run.max_dt, run.open_visits, run.s_day, run.spark
+    v_day = run.v_day
     base = conform_installations(with_position_flags(spark.read.option("mergeSchema", "true").parquet(P("silver/positions"))),
                                  inst_ref)
     raw = base.where((F.col("dt") >= F.lit(s_day)) & (F.col("dt") <= F.lit(max_dt)))
@@ -269,8 +291,18 @@ def main(full=False):
     vdays = build_vessel_days(read).cache()
     coverage = build_coverage(read).cache()
     tracks = build_vessel_tracks(read, int(cfg.get("track_slot_s", 600))).cache()
+    run.base, run.coverage, run.hourly, run.near_v = base, coverage, hourly, near_v
+    run.raw_n, run.read, run.tracks, run.vdays = raw_n, read, tracks, vdays
+    run.visits_new = visits_new
 
-    # ---- use cases 2 and 3: zone entries, loitering, AIS gaps --------------------------------------------
+
+def build_events(run):
+    """Zone entries, waiting and alongside, loitering, AIS gaps and helicopter landings, each with the flags
+    that explain ordinary events (regular visitor, facility, feed outage, ...) and mark the rest worth a look."""
+    P, base, cfg, coverage = run.P, run.base, run.cfg, run.coverage
+    full, near_v, open_visits, read = run.full, run.near_v, run.open_visits, run.read
+    s_day, spark, v_day, visits_new = run.s_day, run.spark, run.v_day, run.visits_new
+    window_start = run.window_start
     sc, rv = cfg.get("surveillance", {}), cfg.get("regular_visitor", {"min_days": 3, "window_days": 30})
     zone_gap = min(cfg.get("zone_gap_s", cfg["visit_gap_s"]), cfg["visit_gap_s"])   # an open entry implies an open visit
     gap_min_s, gap_max_s = int(sc.get("ais_gap_min_minutes", 30) * 60), int(sc.get("ais_gap_max_hours", 12) * 3600)
@@ -328,7 +360,18 @@ def main(full=False):
     if v_day < s_day:
         zones = union_kept(zones_new, kept_published(spark, P("gold/zone_entries"), "entry_ts", open_visits, v_day, s_day)).cache()
         loiter = union_kept(loiter_new, kept_published(spark, P("gold/loitering_events"), "start_ts", open_visits, v_day, s_day)).cache()
+    run.fac_names, run.gap_max_s, run.gap_min_s, run.gaps = fac_names, gap_max_s, gap_min_s, gaps
+    run.landings, run.loiter, run.loiter_new, run.newest = landings, loiter, loiter_new, newest
+    run.sc, run.visits, run.visits_new, run.zones = sc, visits, visits_new, zones
+    run.zones_new = zones_new
 
+
+def measure(run):
+    """Count rows and messages in Silver and in every rebuilt table: the numbers the quality gate compares."""
+    P, cfg, gap_max_s, gap_min_s = run.P, run.cfg, run.gap_max_s, run.gap_min_s
+    gaps, gate, hourly, landings = run.gaps, run.gate, run.hourly, run.landings
+    loiter_new, near_v, read, sc = run.loiter_new, run.near_v, run.read, run.sc
+    tracks, vdays, visits_new, zones_new = run.tracks, run.vdays, run.visits_new, run.zones_new
     _sp = obs.start("gold.silver_stats")
     ship, air = ~F.col("is_aircraft"), F.col("is_aircraft")
     s = read.agg(F.count("*").alias("n"), F.max("event_ts").alias("max_ts"),
@@ -364,8 +407,19 @@ def main(full=False):
     if gr is not None and gr > gate.get("max_sog_glitch_rate", 0.001):
         warnings.append(f"speed glitches (> {cfg.get('max_ship_kn', 50)} kn, nulled) are {gr:.4%} of {gr_n} positions in the "
                         f"last 24 h, above {gate.get('max_sog_glitch_rate', 0.001):.2%}: check the feed or a faulty transponder")
+    run.d, run.flags, run.g, run.gr = d, flags, g, gr
+    run.h, run.hl, run.lo, run.rr = h, hl, lo, rr
+    run.rr_in, run.s, run.sv, run.tr = rr_in, s, sv, tr
+    run.v, run.warnings, run.z = v, warnings, z
 
-    # ---- keys: every recomputed table should be unique on its key (a full run checks its newest days only) ---
+
+def check_keys(run):
+    """Count repeated keys in every rebuilt table. A repeat is a warning, not a gate failure."""
+    P, cfg, coverage, full = run.P, run.cfg, run.coverage, run.full
+    gaps, hourly, landings, loiter_new = run.gaps, run.hourly, run.landings, run.loiter_new
+    max_dt, raw_n, s, s_day = run.max_dt, run.raw_n, run.s, run.s_day
+    spark, tracks, vdays, visits_new = run.spark, run.tracks, run.vdays, run.visits_new
+    warnings, window_start, zones_new = run.warnings, run.window_start, run.zones_new
     _sp = obs.start("gold.keys")
     check_from = s_day if not full else max(window_start, max_dt - timedelta(days=cfg.get("gold_recent_days", 2) - 1))
     recomputed = {"vessel_visits": visits_new, "installation_activity_hourly": hourly, "vessel_days": vdays,
@@ -383,8 +437,15 @@ def main(full=False):
     if raw_n is not None and raw_n - (s["n"] or 0) > 0:
         warnings.append(f"Silver held {raw_n - s['n']} duplicate (mmsi, event_ts) rows from {s_day}; Gold removed them, "
                         "but Silver's own deduplication should have: check the left_anti step in silver_job")
+    run.check_from, run.dups, run.inst_dim = check_from, dups, inst_dim
 
-    # ---- quality gate: every recomputed table must reconcile with Silver for the same days ---------------
+
+def run_checks(run):
+    """The 12-check quality gate: Silver input usable, every table adds up to Silver, events follow their rules."""
+    d, g, gate, h = run.d, run.g, run.gate, run.h
+    hl, lo, rr, rr_in = run.hl, run.lo, run.rr, run.rr_in
+    s, s_day, sv, tr = run.s, run.s_day, run.sv, run.tr
+    v, v_day, z = run.v, run.v_day, run.z
     checks = []
     def chk(name, ok, detail):
         checks.append({"check": name, "passed": bool(ok), "detail": detail})
@@ -410,7 +471,18 @@ def main(full=False):
         f"landings={hl['n']} ({hl['msgs']} msgs) silver aircraft in zones={s['zone_air']}")
     chk("no_negative_durations_or_null_keys", (v["neg"] or 0) == 0 and (v["nullkeys"] or 0) == 0, f"neg={v['neg']} nullkeys={v['nullkeys']}")
     ok = all(c["passed"] for c in checks)
+    run.checks, run.n_s, run.ok = checks, n_s, ok
 
+
+def write_manifest(run):
+    """Collect what this run did into the manifest and send the checks and warnings to tracing."""
+    cfg, check_from, checks, d = run.cfg, run.check_from, run.checks, run.d
+    dups, flags, full, g = run.dups, run.flags, run.full, run.g
+    gr, h, hl, lo = run.gr, run.h, run.hl, run.lo
+    max_dt, n_s, ok, open_visits = run.max_dt, run.n_s, run.ok, run.open_visits
+    raw_n, run_id, s, s_day = run.raw_n, run.run_id, run.s, run.s_day
+    started, tr, v, v_day = run.started, run.tr, run.v, run.v_day
+    warnings, z = run.warnings, run.z
     manifest_keys = {"check_from": str(check_from), "repeated_keys": dups}
     manifest = {"run_id": run_id, "env": cfg["env"], "started_at": started.isoformat(), "mode": "full" if full else "incremental",
                 "recompute_from": str(s_day), "visits_from": str(v_day), "newest_day": str(max_dt),
@@ -429,6 +501,13 @@ def main(full=False):
                  failed_checks=[c["check"] for c in checks if not c["passed"]])
     for c in checks:
         obs.event("check", check=c["check"], passed=c["passed"], detail=c["detail"])
+    run.manifest = manifest
+
+
+def stop_if_blocked(run):
+    """If any check failed: write _LAST_FAILED.json, log the run, keep the published Gold and stop."""
+    P, cfg, manifest, ok = run.P, run.cfg, run.manifest, run.ok
+    spark, started = run.spark, run.started
     os.makedirs(P("gold"), exist_ok=True)
     if not ok:
         obs.mark_error("quality gate failed")
@@ -441,7 +520,16 @@ def main(full=False):
             build_dashboard(spark, cfg, P, published)
         print(json.dumps(manifest, indent=2)); sys.exit("Gold NOT published: quality checks failed")
 
-    # ---- publish: staged days swapped in one partition at a time; dimensions rebuilt and swapped -----------
+
+def publish(run):
+    """Write the rebuilt days to staging and swap them in, then rebuild and swap the whole-window tables
+    (vessels with their classification, installations, safety zone entries, standby gaps, outages, radar)."""
+    P, cfg, coverage, fac_names = run.P, run.cfg, run.coverage, run.fac_names
+    full, gaps, hourly, inst_dim = run.full, run.gaps, run.hourly, run.inst_dim
+    landings, loiter, manifest, max_dt = run.landings, run.loiter, run.manifest, run.max_dt
+    newest, run_id, s_day, sc = run.newest, run.run_id, run.s_day, run.sc
+    spark, tracks, v_day, vdays = run.spark, run.tracks, run.v_day, run.vdays
+    visits, window_start, zones = run.visits, run.window_start, run.zones
     _sp = obs.start("gold.publish")
     stage = P(f"gold/_staging/{run_id}")
     visits.write.mode("overwrite").partitionBy("dt").parquet(f"{stage}/vessel_visits")
@@ -491,6 +579,11 @@ def main(full=False):
     shutil.rmtree(P("gold/_staging"), ignore_errors=True)
     _sp.end()
 
+
+def finish(run):
+    """Write _READY.json, the run log and the state for the next run; then pipeline loitering and the dashboard."""
+    P, cfg, manifest, names_hash = run.P, run.cfg, run.manifest, run.names_hash
+    run_id, spark, started = run.run_id, run.spark, run.started
     tables = {t: (read_table(spark, P(f"gold/{t}")).count() if plan.has_data(P(f"gold/{t}")) else 0)
               for t in PARTITIONED + DIMENSIONS}
     fin = datetime.now(timezone.utc)
@@ -508,6 +601,24 @@ def main(full=False):
     except Exception as e:
         print(f"pipeline loitering not updated: {e!r}")
     build_dashboard(spark, cfg, P, manifest)
+
+
+def main(full=False):
+    """Build Gold from Silver and publish it only if the quality gate passes. Each step reads what it needs
+    from `run` (this run's state) and stores what later steps use, so the data flow is visible step by step."""
+    run = SimpleNamespace(full=full)
+    start_run(run)
+    installation_key(run)
+    plan_days(run)
+    read_silver(run)
+    build_events(run)
+    measure(run)
+    check_keys(run)
+    run_checks(run)
+    write_manifest(run)
+    stop_if_blocked(run)
+    publish(run)
+    finish(run)
 
 
 def traced_main():

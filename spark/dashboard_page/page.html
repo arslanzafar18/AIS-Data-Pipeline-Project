@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vessel activity at Norwegian oil and gas installations</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<style>
+/*__CSS__*/
+</style>
+</head>
+<body>
+<main>
+<h1>Vessel activity at Norwegian oil and gas installations</h1>
+<p class="status" id="status"></p>
+<div class="tabs" role="tablist">
+  <button type="button" role="tab" data-tab="traffic" aria-selected="true">Traffic</button>
+  <button type="button" role="tab" data-tab="safety" aria-selected="false">Safety zones</button>
+  <button type="button" role="tab" data-tab="surv" aria-selected="false">Surveillance</button>
+  <button type="button" role="tab" data-tab="vessel" aria-selected="false">Vessel</button>
+  <button type="button" role="tab" data-tab="health" aria-selected="false">Pipeline health</button>
+</div>
+<div class="range">
+  <div class="range-head">
+    <span>Showing <strong id="rangeLabel"></strong></span>
+    <span class="presets"><button type="button" data-days="1">Last day</button><button type="button" data-days="7">7 days</button><button type="button" data-days="30">30 days</button><button type="button" data-days="0">All</button></span>
+  </div>
+  <div class="dual"><div class="track"></div><div class="fill" id="fill"></div>
+    <input type="range" id="from" min="0" step="1" aria-label="First day"><input type="range" id="to" min="0" step="1" aria-label="Last day"></div>
+  <div class="ends"><span id="first"></span><span id="last"></span></div>
+</div>
+<div class="bar">
+  <ul class="kpis" id="kpis"></ul>
+  <div class="seg" role="group" aria-label="Installations shown" id="grpSeg">
+    <button type="button" data-g="all" aria-pressed="true">All</button><button type="button" data-g="offshore" aria-pressed="false">Offshore</button><button type="button" data-g="onshore" aria-pressed="false">Onshore</button>
+  </div>
+</div>
+
+<div data-panel="traffic">
+  <section><h2>Supply and service traffic at installations</h2>
+    <details class="help" open><summary>How to read and use this page</summary>
+      <dl class="defs">
+        <dt>Visit</dt><dd>A vessel within 5 km of an offshore installation (1.5 km for onshore terminals). 30 minutes without a position starts a new visit.</dd>
+        <dt>Service call</dt><dd>A visit that came inside the installation's 500 m safety zone. Only vessels with permission may enter the zone, so entering it is a good sign of supply, standby or crew work. It is inferred from positions: the data does not say what the work was.</dd>
+        <dt>Installation transmitters</dt><dd>Platforms, FPSOs and rigs that broadcast AIS under their own Sodir name are not vessels serving anyone, so they are left out of this tab.</dd>
+        <dt>Passing visit</dt><dd>A visit that stayed outside 500 m: usually a ship sailing past.</dd>
+        <dt>Waiting</dt><dd>Time within 5 km before entering the 500 m zone, for example waiting for permission, the crane or the weather. Long waits point to queues or delays.</dd>
+        <dt>Alongside</dt><dd>Time inside the 500 m zone, where the work happens. Long times point to heavy jobs or standby duty.</dd>
+      </dl>
+      <p class="example">Example of one service call: arrives within 5 km 08:00 → waits 40 min → enters the zone 08:40 → alongside 3 h → leaves 11:40.</p>
+      <ol class="howto">
+        <li>Choose the days with the slider at the top.</li>
+        <li>Pick an installation: click it on the map, type its name below, or click its bar or table row. Every number on this tab then shows that installation only.</li>
+        <li>Read its workload per day, when vessels arrive, and how long they wait and stay.</li>
+        <li>The table lists the vessels serving it and the other installations they serve. Click a vessel name for its full history.</li>
+      </ol>
+    </details>
+    <div class="search"><input id="iq" list="ilist" placeholder="Pick an installation, e.g. HEIDRUN" aria-label="Installation"><datalist id="ilist"></datalist>
+      <button type="button" id="iclear" class="plain">All installations</button></div>
+    <p class="glance" id="glance"></p></section>
+  <section><h2>Where service calls happen</h2><p class="note">Click a circle to pick that installation.</p>
+    <ul class="legend" aria-label="Map legend"><li><span class="dot" style="background:var(--accent)"></span>Offshore installation</li>
+      <li><span class="dot" style="background:var(--onshore)"></span>Onshore terminal</li>
+      <li><span class="dot ring"></span>Picked installation</li><li><span class="sizes"><span></span><span></span><span></span></span>Larger circle = more service calls</li></ul>
+    <div class="map" id="mapT"></div></section>
+  <section id="secTop"><h2>Busiest installations</h2><p class="note">Top 15 by service calls in the selected days. Click a bar to pick that installation.</p><div class="chart tall"><canvas id="cTop"></canvas></div></section>
+  <section><h2 id="hDaily">Service calls per day</h2><p class="note" id="nDaily"></p><div class="chart"><canvas id="cDaily"></canvas></div></section>
+  <div class="grid">
+    <section><h2>When vessels arrive</h2><p class="note">Service calls by hour of arrival within 5 km, Norwegian time</p><div class="chart"><canvas id="cArr"></canvas></div></section>
+    <section><h2>Waiting and time alongside</h2><p class="note">Per service call: minutes within 5 km before entering the zone, and minutes inside it</p><div class="chart"><canvas id="cDur"></canvas></div></section>
+  </div>
+  <section><h2 id="hTable"></h2><p class="note" id="nTable"></p><div class="scroll" id="tTraffic"></div></section>
+</div>
+
+<div data-panel="safety" hidden>
+  <section><h2>Safety monitoring and emergency preparedness</h2>
+    <details class="help" open><summary>How to read and use this page</summary>
+      <dl class="defs">
+        <dt>Zone entry</dt><dd>A vessel inside an installation's 500 m safety zone; 30 minutes without a position inside starts a new entry. Only vessels with permission may enter.</dd>
+        <dt>Fast entry</dt><dd>A zone entry with a speed over <span class="rv" data-r="fast_kn"></span> kn recorded inside 500 m. Speeds above 50 kn are GPS errors and already removed; a single fast reading can still be noise, repeated ones are worth checking.</dd>
+        <dt>Risk</dt><dd>Collision energy grows with a vessel's mass and the square of its speed, so fast entries are ranked by size and speed together.
+          <b>High</b>: 80 m or longer at over 10 kn, or 24 to 80 m at over 15 kn. <b>Medium</b>: 24 to 80 m at 10 to 15 kn, or length unknown.
+          <b>Low</b>: under 24 m, or a rescue craft. These thresholds are this dashboard's own judgement, not an industry standard.</dd>
+        <dt>Rescue craft</dt><dd>A fast rescue boat or daughter craft launched from a standby vessel for drills, crew transfers and call-outs: AIS type "search and rescue" under 24 m, or a name containing FRB, FRC, MOB, DC (with or without a number) or DAUGHTER. They are built to run at 25 to 30 kn, so they rank as low risk.</dd>
+        <dt>Offshore fleet</dt><dd>Vessels that entered the 500 m zone of at least 2 different offshore installations, or at least 5 times in total, or made at least 10 visits within 5 km of offshore installations, or spent at least 48 hours in total within 5 km of them (standby and field vessels that wait outside the zone), or stayed at least 1 hour inside the zone of the same installation on 2 or more different days (a supply vessel serving one field), in the whole data period. A vessel that only meets the last rule but has no business there still shows on the Surveillance tab as loitering. Supply, standby, diving and crew vessels fall in this group whatever ship type their AIS reports (many supply vessels report "cargo").</dd>
+        <dt>Unexpected entry</dt><dd>An entry into an offshore installation's 500 m zone by a fishing vessel, or by a vessel outside the offshore fleet: a ship that almost never comes inside any safety zone.</dd>
+        <dt>Fishing vessel</dt><dd>Registered in the Norwegian fishing vessel register (Fiskeridirektoratet, matched on radio call sign), or reporting AIS ship type "fishing". Foreign fishing vessels are only found by their AIS type, and boats under 15 m often carry no AIS.</dd>
+        <dt>Vessel presence</dt><dd>The share of hours with at least one vessel within 5 km of an offshore installation. Hours when the whole feed was thin are left out. Offshore Norge guideline 064 sets rescue times (a person overboard picked up within 8 min; a ditched helicopter or evacuation to sea rescued within 120 min) but no fixed distance for standby vessels, and one vessel often covers several installations. So presence is context, not a test of those requirements.</dd>
+        <dt>Helideck landing</dt><dd>A search-and-rescue aircraft (MMSI 111xxxxxx, or an aircraft reporting altitude) inside the 500 m zone.</dd>
+      </dl>
+      <ol class="howto">
+        <li>Choose the days with the slider at the top.</li>
+        <li>Pick an installation on the map, by name below, or from the preparedness table; the lists then show that installation only. The pick is shared with the Traffic tab.</li>
+        <li>Start with the unexpected entries and fishing vessels, then the fast entries. The presence table shows how often each installation had a vessel nearby.</li>
+      </ol>
+    </details>
+    <div class="search"><input id="sq" list="ilist" placeholder="Pick an installation, e.g. HEIDRUN" aria-label="Installation"><button type="button" id="sclear" class="plain">All installations</button></div>
+    <p class="glance" id="sglance"></p></section>
+  <section><h2>Entries into 500 m safety zones</h2><p class="note">Click a circle to pick that installation.</p>
+    <ul class="legend" aria-label="Map legend"><li><span class="dot" style="background:var(--accent)"></span>Offshore installation</li>
+      <li><span class="dot" style="background:var(--onshore)"></span>Onshore terminal</li><li><span class="dot ring"></span>Fast entries recorded</li>
+      <li><span class="sizes"><span></span><span></span><span></span></span>Larger circle = more zone entries</li></ul>
+    <div class="map" id="mapZ"></div></section>
+  <section><h2>Unexpected zone entries</h2><p class="note">Fishing vessels and vessels outside the offshore fleet inside 500 m of an offshore installation, newest first.</p><div class="scroll" id="tUnexp"></div></section>
+  <section><h2>Fishing vessels near installations</h2><p class="note" id="nFish"></p><div class="scroll" id="tFish"></div></section>
+  <section><h2>Fast zone entries by risk</h2><p class="note" id="noteFast"></p><div class="scroll" id="tFast"></div></section>
+  <section><h2 id="hPrep">Vessel presence and helideck landings</h2><p class="note" id="nPrep"></p><div class="scroll" id="tPrep"></div></section>
+</div>
+
+<div data-panel="surv" hidden>
+  <section><h2>Security of offshore infrastructure</h2>
+    <details class="help" open><summary>How to read and use this page</summary>
+      <dl class="defs">
+        <dt>Loitering</dt><dd>A vessel under 2 kn within 5 km of an installation for at least 2 hours.</dd>
+        <dt>AIS gap</dt><dd>A vessel near an installation that sent nothing anywhere for at least 30 minutes, then reappeared.</dd>
+        <dt>Worth a look</dt><dd>An event with no ordinary explanation: not a regular visitor, not a facility's own transmitter, not a large ship at a terminal, not support craft, and not during a feed outage.</dd>
+        <dt>Loitering over a pipeline</dt><dd>A vessel under 2 kn within 500 m of an in-service pipeline (Sodir) for at least 2 hours, at least 5 km from any installation. Anchoring or dragging gear there is a damage and sabotage risk. Cables are not in the Sodir data.</dd>
+        <dt>Dark vessel detection</dt><dd>A vessel seen by satellite radar (Sentinel-1) that matches no AIS signal, within <span class="rv" data-r="dark_inst_m"></span> m of an offshore facility or <span class="rv" data-r="dark_pipe_m"></span> m of a pipeline. Positions are 0.01 degree grid cells (about 1 km), data arrive about 5 days late and only when a satellite passes, and very small boats are not detected. A detection right next to an installation can be a rig or another structure rather than a vessel.</dd>
+      </dl>
+      <ol class="howto">
+        <li>Choose the days with the slider at the top; live AIS data only.</li>
+        <li>Start with "Worth a look", then the pipeline loitering and the dark detections.</li>
+        <li>Click a row to see it on the map, a vessel name to open its profile.</li>
+      </ol>
+    </details></section>
+  <section><h2>Events near installations and pipelines</h2><p class="note">Click a marker for details.</p>
+    <ul class="legend" aria-label="Map legend"><li><span class="dot" style="background:var(--warn)"></span>Events worth a look at an installation</li>
+      <li><span class="dot" style="background:var(--muted)"></span>Ordinary events</li><li><span class="dot" style="background:var(--signal)"></span>Loitering over a pipeline</li>
+      <li><span class="dot" style="background:var(--ink)"></span>Dark vessel detection (radar)</li><li><span class="line"></span>Pipeline in service</li></ul>
+    <div class="map" id="mapS"></div><p class="attr" id="attrS"></p></section>
+  <section><h2>Events</h2>
+    <div class="bar" style="margin-top:0"><p class="note" id="noteS" style="margin:0"></p>
+      <div class="seg" id="survSeg"><button type="button" data-s="look" aria-pressed="true">Worth a look</button><button type="button" data-s="all" aria-pressed="false">All events</button></div></div>
+    <div class="scroll" id="tSurv"></div></section>
+  <section><h2>Loitering over pipelines</h2><p class="note" id="notePL"></p><div class="scroll" id="tPL"></div></section>
+  <section><h2>Dark vessel detections near infrastructure</h2><p class="note" id="noteDK"></p><div class="scroll" id="tDK"></div><p class="attr" id="attrDK"></p></section>
+</div>
+
+<div data-panel="health" hidden>
+  <section><h2>Pipeline health</h2>
+    <p class="note">How the pipeline itself is doing in the selected days, layer by layer: did the data arrive in Bronze, what did Silver reject or correct, and did each hourly Gold run publish.</p>
+    <details class="help"><summary>How to read this tab</summary>
+      <ul class="howto">
+        <li><b>Freshness</b> says when each layer last did its work. Anything marked <span class="tag look">Check</span> is older than normal.</li>
+        <li><b>Bronze checks</b>: did every expected file arrive (the collector writes one every 2 minutes, 720 a day), how many messages per hour reached Silver (orange hours are feed outages), do the AIS messages still have the expected fields, and do the reference files still have the columns the pipeline reads.</li>
+        <li><b>Silver checks</b>: per day, the rows that came in, were accepted, were rejected (by reason; kept in <code>silver/rejects</code> with the raw message), were removed as duplicates, or had an impossible value corrected.</li>
+        <li><b>Gold checks</b>: every hourly run. A run blocked by the quality gate, or a crash, leaves the previous Gold published; the log names the failed checks and any warning.</li>
+      </ul>
+      <p class="note">Sources: the collector's log and heartbeat, <code>quality/silver_metrics.jsonl</code> (one line per Silver batch), the Gold table <code>feed_coverage_hourly</code> and <code>quality/gold_runs.jsonl</code> (one line per Gold run).</p>
+    </details></section>
+  <section><h2>Freshness</h2><p class="note" id="nFresh"></p><div class="scroll" id="tFresh"></div></section>
+  <section><h2>Bronze checks</h2>
+    <h3 class="sub">Files received</h3><p class="note" id="nFiles"></p><div class="scroll" id="tFiles"></div>
+    <h3 class="sub">Messages per hour</h3><p class="note" id="nFeed"></p><div class="chart"><canvas id="cFeed"></canvas></div>
+    <h3 class="sub">Fields in the AIS messages</h3><p class="note" id="nBronze"></p><div class="scroll" id="tBronze"></div>
+    <h3 class="sub">Reference files</h3><p class="note">Does each reference file still have every column the pipeline reads? A fetch refuses to replace a file whose source changed its fields, so a problem here also shows as an old update time.</p><div class="scroll" id="tRef"></div>
+  </section>
+  <section><h2>Silver checks</h2><p class="note" id="nSilT"></p><div class="scroll" id="tSil"></div>
+    <div class="grid">
+      <div><h3 class="sub">Rejected rows per day, by reason</h3><div class="chart"><canvas id="cRej"></canvas></div></div>
+      <div><h3 class="sub">Batch times per day</h3><p class="note" id="nSil"></p><div class="chart"><canvas id="cSil"></canvas></div></div>
+    </div>
+  </section>
+  <section><h2>Gold checks</h2><p class="note" id="nRuns"></p><div class="chart"><canvas id="cRuns"></canvas></div>
+    <h3 class="sub">Run log</h3><p class="note">Newest first. <b>Silver rows read</b>: the Silver positions this run read for the days it recomputed (its input). <b>Repeated keys</b>: rows in the Gold tables it built that share a key with another row (its output; should be 0).</p><div class="scroll" id="tRuns"></div>
+  </section>
+</div>
+
+<div data-panel="vessel" hidden>
+  <section><h2>Find a vessel</h2><div class="search"><input id="vq" list="vlist" placeholder="Name or MMSI, e.g. ESVAGT AURORA"><datalist id="vlist"></datalist></div>
+    <p class="note" id="vnote" style="margin-top:10px"></p></section>
+  <div id="vbody" hidden>
+    <section><h2 id="vname"></h2><p class="note" id="vident"></p><ul class="kpis" id="vkpis"></ul>
+      <p class="note" style="margin-top:12px">Route map and day-by-day history: <code id="vcmd"></code></p></section>
+    <section><h2>Surveillance events</h2><div class="scroll" id="vEv"></div></section>
+    <section><h2>Safety-zone entries</h2><div class="scroll" id="vZn"></div></section>
+    <section><h2>Visits to installations</h2><div class="scroll" id="vVi"></div></section>
+  </div>
+</div>
+<footer>Rebuilt from the published Gold tables after each hourly Gold run (also after a run the quality gate blocked, so the Pipeline health tab shows it); this page reloads every 5 minutes while you are not using it.</footer>
+</main>
+<script type="application/json" id="data">__DATA__</script>
+<script>
+//__JS__
+</script>
+</body>
+</html>
