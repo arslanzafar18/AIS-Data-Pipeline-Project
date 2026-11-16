@@ -112,6 +112,18 @@ def test_fishing_register_is_matched_on_call_sign(spark, tmp_path):
     assert data["ves"]["1"][4] == 1 and data["ves"]["2"][4] == 0 and data["fishing_register"] is True
 
 
+
+def test_dashboard_reads_the_fishing_match_from_gold(spark, tmp_path):
+    visits = spark.createDataFrame([(m, "PLATFORM", "JACKET 4 LEGS", False, T, 30.0, 0) for m in (1, 2, 3)], VISITS)
+    hourly = spark.createDataFrame([("PLATFORM", T, 3, False)], HOURLY)
+    vessels = spark.createDataFrame([(1, "A", 30, 18, False, "LK1", "strong"), (2, "B", 30, 18, False, "LK2", "weak"),
+                                     (3, "C", 30, 18, False, "LK3", None)],
+                                    "mmsi long, name string, ship_type int, length_m int, is_facility boolean, call_sign string, "
+                                    "fishing_match string")
+    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path / "out"),
+                                 vessels=vessels, fishing_call_signs={"LK3"}))
+    assert [data["ves"][k][4] for k in ("1", "2", "3")] == [2, 1, 0]    # Gold's match wins over the raw call-sign list
+
 def test_pipeline_lines_and_dark_detections(tmp_path):
     p = tmp_path / "pipelines.csv"
     p.write_text("pipeline_id,name,label,medium,phase,seg_no,lon1,lat1,lon2,lat2\n"

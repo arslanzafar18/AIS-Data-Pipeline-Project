@@ -58,6 +58,7 @@
     "facility_stationary_kn": 1.0,
     "faulty_speed_min_count": 10,
     "faulty_speed_min_share": 0.01,
+    "fishing_length_tol_m": 3.0,
     "pipeline_near_m": 500,
     "pipeline_phases": [
       "IN SERVICE"
