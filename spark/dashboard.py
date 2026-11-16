@@ -15,13 +15,14 @@ View it:   python3 -m http.server 8050 --bind 127.0.0.1 --directory <data_root>/
 Preview from any Gold folder (read-only on the tables; writes ./dashboard-preview unless --out is given):
            PYTHONPATH=. python -m spark.dashboard --gold-dir data/prod/gold [--out folder]
 """
-import argparse, json, math, os, shutil
+import argparse, json, os, shutil
 from datetime import datetime, timedelta, timezone
 from pyspark.sql import functions as F
 
 BUCKETS = [(15, "Under 15 min"), (60, "15 to 60 min"), (180, "1 to 3 h"), (720, "3 to 12 h"),
            (1440, "12 to 24 h"), (None, "Over 24 h")]
 # bit flags of a surveillance event, decoded by the page
+RISK = {"high": 0, "medium": 1, "low": 2}       # Gold risk_level -> sort order on the page
 FLAG_BITS = {"regular_visitor": 1, "is_facility": 2, "censored": 4, "feed_outage": 8, "terminal_call": 16,
              "support_craft": 32, "worth_a_look": 64}
 
@@ -42,58 +43,8 @@ def _col(df, c):
     return F.col(c) if c in df.columns else F.lit(None)
 
 
-def visit_zone_times(visits, zones):
-    """Per visit: minutes from arrival within the near radius until the first 500 m zone entry (wait_min) and minutes
-    inside the zone in total (alongside_min). Zone entries are matched to the visit of the same vessel and installation
-    that contains them; visits that never entered the zone get nulls."""
-    if zones is None:
-        return visits.withColumn("wait_min", F.lit(None).cast("double")).withColumn("alongside_min", F.lit(None).cast("double"))
-    v = visits.alias("v")
-    z = zones.select("mmsi", "inst_name", "entry_ts", "minutes_inside").alias("z")
-    dep = (F.col("v.departure_ts") if "departure_ts" in visits.columns
-           else (F.col("v.arrival_ts").cast("long") + F.col("v.duration_min") * 60).cast("timestamp"))
-    hit = (v.join(z, (F.col("v.mmsi") == F.col("z.mmsi")) & (F.col("v.inst_name") == F.col("z.inst_name"))
-                  & F.col("z.entry_ts").between(F.col("v.arrival_ts"), dep))
-            .groupBy(F.col("v.mmsi").alias("mmsi"), F.col("v.inst_name").alias("inst_name"), F.col("v.arrival_ts").alias("arrival_ts"))
-            .agg(F.min("z.entry_ts").alias("_first"), F.sum("z.minutes_inside").alias("alongside_min")))
-    return (visits.join(hit, ["mmsi", "inst_name", "arrival_ts"], "left")
-                  .withColumn("wait_min", (F.col("_first").cast("long") - F.col("arrival_ts").cast("long")) / 60.0)
-                  .drop("_first"))
-
-
-def standby_gaps(hourly, coverage, min_fraction, start, end):
-    """Runs of consecutive hours in which no vessel was within the near radius of an OFFSHORE installation, counting only
-    hours the feed covered (an hour with under min_fraction of the median message volume is unknown and splits a run).
-    One row per run: inst_name, start hour, hours."""
-    from spark.gold_logic import covered_hours
-    from pyspark.sql import Window
-    off = hourly.where(~F.coalesce(F.col("is_onshore").cast("boolean"), F.lit(False))) if "is_onshore" in hourly.columns else hourly
-    grid = (off.select("inst_name").distinct()
-               .withColumn("hour_ts", F.explode(F.sequence(F.lit(start), F.lit(end), F.expr("INTERVAL 1 HOUR")))))
-    ok = covered_hours(coverage, min_fraction, end).withColumnRenamed("_h", "hour_ts")
-    present = off.select("inst_name", F.date_trunc("hour", "hour_ts").alias("hour_ts")).distinct().withColumn("_p", F.lit(True))
-    empty = (grid.join(F.broadcast(ok), "hour_ts").join(present, ["inst_name", "hour_ts"], "left").where(F.col("_p").isNull())
-                 .withColumn("_i", (F.col("hour_ts").cast("long") / 3600).cast("long")))
-    run = F.col("_i") - F.row_number().over(Window.partitionBy("inst_name").orderBy("_i"))
-    return (empty.withColumn("_run", run).groupBy("inst_name", "_run")
-                 .agg(F.min("hour_ts").alias("start_ts"), F.count("*").alias("hours")).drop("_run"))
-
-
-def norm_call_sign(c):
-    return "".join(ch for ch in str(c or "").upper() if ch.isalnum())
-
-
-def load_fishing_call_signs(path):
-    """Radio call signs of registered Norwegian fishing vessels (bronze/reference/fishing_vessels.csv, column call_sign)."""
-    import csv
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, newline="", encoding="utf-8") as f:
-        return {norm_call_sign(r.get("call_sign")) for r in csv.DictReader(f)} - {""}
-
-
 def pipeline_lines(path, phases=("IN SERVICE",)):
-    """Sodir pipeline segments (bronze/reference/pipelines.csv) -> map polylines and the segment list.
+    """Sodir pipeline segments (bronze/reference/pipelines.csv) -> map polylines (drawing only) and the segment list.
     Consecutive segments that join end to start form one line; a jump starts a new one."""
     import csv
     if not path or not os.path.exists(path):
@@ -112,52 +63,6 @@ def pipeline_lines(path, phases=("IN SERVICE",)):
             key = r["pipeline_id"]
         cur[2].append([round(b[0], 4), round(b[1], 4)])
     return lines, out
-
-
-def dark_near_infrastructure(detections, installations, segments, inst_m, pipe_m, cell=0.1):
-    """Radar detections within inst_m of an offshore installation or pipe_m of a pipeline, each with the nearest of
-    both. A grid of `cell` degrees keeps the number of distance checks small."""
-    import math
-    from spark.gold_pipelines import point_segment_m_py
-
-    def hav(a1, o1, a2, o2):
-        p1, p2 = math.radians(a1), math.radians(a2)
-        h = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(o2 - o1) / 2) ** 2
-        return 2 * 6371000.0 * math.asin(math.sqrt(h))
-
-    grid = {}
-    reach = max(inst_m, pipe_m) / 111320.0 + cell
-    def add(kind, item, la0, lo0, la1, lo1):
-        for gy in range(math.floor((la0 - reach) / cell), math.floor((la1 + reach) / cell) + 1):
-            for gx in range(math.floor((lo0 - 2 * reach) / cell), math.floor((lo1 + 2 * reach) / cell) + 1):
-                grid.setdefault((gy, gx), ([], []))[kind].append(item)
-    for it in installations:
-        add(0, it, it[1], it[2], it[1], it[2])
-    for sg in segments:
-        add(1, sg, min(sg[2], sg[4]), min(sg[3], sg[5]), max(sg[2], sg[4]), max(sg[3], sg[5]))
-    out = []
-    for d in detections:
-        lat, lon = d["lat"], d["lon"]
-        insts, segs = grid.get((math.floor(lat / cell), math.floor(lon / cell)), ([], []))
-        bi = min(((hav(lat, lon, i[1], i[2]), i[0]) for i in insts), default=(None, None))
-        bp = min(((point_segment_m_py(lat, lon, s_[2], s_[3], s_[4], s_[5]), s_[0]) for s_ in segs), default=(None, None))
-        near_i = bi[0] is not None and bi[0] <= inst_m
-        near_p = bp[0] is not None and bp[0] <= pipe_m
-        if near_i or near_p:
-            out.append({**d, "inst": bi[1] if near_i else None, "inst_m": round(bi[0]) if near_i else None,
-                        "pipe": bp[1] if near_p else None, "pipe_m": round(bp[0]) if near_p else None})
-    return out
-
-
-def read_sar(path):
-    import csv
-    if not path or not os.path.exists(path):
-        return None, None
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    dets = [{"date": r["date"], "lat": float(r["lat"]), "lon": float(r["lon"]), "n": int(r["detections"] or 0)} for r in rows]
-    meta = {"versions": sorted({r["dataset"] for r in rows}), "accessed": max((r["fetched_at"] for r in rows), default=None)}
-    return dets, meta
 
 
 REJECT_REASONS = ("parse_failed", "bad_mmsi", "bad_timestamp", "missing_position", "sentinel_position", "out_of_range",
@@ -184,7 +89,7 @@ def _jsonl(path):
                 continue
 
 
-SAR_COLUMNS = ["date", "lat", "lon", "detections", "dataset", "fetched_at"]          # read by read_sar
+SAR_COLUMNS = ["date", "lat", "lon", "detections", "dataset", "fetched_at"]          # read by Gold (dark_detections)
 FISHING_COLUMNS = ["vessel_id", "call_sign", "name", "length_m"]                 # read by Gold (match_fishing_register)
 
 
@@ -316,7 +221,7 @@ def pipeline_health(t0, quality_dir=None, metrics_dir=None, gold_dir=None, now=N
 
 
 def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=None, gaps=None, outage_hours=None,
-              fishing_call_signs=None, extra_mmsi=None):
+              extra_mmsi=None):
     """Compact, column-wise data: one entry per visit, zone entry, event and hour, so the browser can recompute
     every number for any date range. Times are whole hours since t0 (midnight of the first day)."""
     end = hourly.agg(F.max("hour_ts")).collect()[0][0]
@@ -326,14 +231,16 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=No
     names = {r["inst_name"]: (r["inst_kind"], bool(r["onshore"])) for r in
              visits.groupBy("inst_name").agg(F.first("inst_kind", ignorenulls=True).alias("inst_kind"),
                                              F.max(on_v).alias("onshore")).collect()}
-    vr = (visit_zone_times(visits, zones)
-          .select("inst_name", "mmsi", "arrival_ts", "duration_min", "entered_zone", "wait_min", "alongside_min").collect())
+    vr = visits.select("inst_name", "mmsi", "arrival_ts", "duration_min", "entered_zone", _col(visits, "wait_min").alias("wait_min"),
+                       _col(visits, "alongside_min").alias("alongside_min")).collect()     # both computed in Gold
     hr = (hourly.groupBy("hour_ts")
                 .agg(F.sum(F.when(on_h, 0).otherwise(F.col("distinct_vessels"))).alias("off"),
                      F.sum(F.when(on_h, F.col("distinct_vessels")).otherwise(0)).alias("on"))
                 .orderBy("hour_ts").collect())
-    zr = (zones.select("inst_name", "mmsi", "entry_ts", "minutes_inside", _col(zones, "max_sog_kn").alias("kn"),
-                       "min_dist_m").collect() if zones is not None else [])
+    zr = (zones.select("inst_name", "mmsi", "entry_ts", "minutes_inside", _col(zones, "max_sog_kn").alias("kn"), "min_dist_m",
+                       _col(zones, "is_fast").alias("fast"), _col(zones, "risk_level").alias("rl"),
+                       _col(zones, "risk_reason").alias("rw"), _col(zones, "is_unexpected").alias("u"),
+                       _col(zones, "earlier_entries").alias("b")).collect() if zones is not None else [])   # Gold safety_zone_entries
     er = []
     if events is not None:
         flags = sum((F.coalesce(_col(events, k).cast("int"), F.lit(0)) * bit) for k, bit in FLAG_BITS.items())
@@ -350,16 +257,13 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=No
     hrs = lambda ts: int((ts - t0).total_seconds() // 3600)
     seen = {r["mmsi"] for r in vr} | {r["mmsi"] for r in zr} | {r["mmsi"] for r in er} | set(extra_mmsi or [])
     ves = {}
-    if vessels is not None:
-        fish = fishing_call_signs or set()
-        in_gold = "fishing_match" in vessels.columns     # Gold matched the register (call sign confirmed by name/length)
+    if vessels is not None:      # every classification below is a Gold column (spark/gold_logic.classify_vessels)
         for r in vessels.select("mmsi", _col(vessels, "name").alias("name"), _col(vessels, "ship_type").alias("st"),
-                                _col(vessels, "call_sign").alias("cs"), _col(vessels, "fishing_match").alias("fm"),
-                                _col(vessels, "length_m").alias("len"), _col(vessels, "is_facility").alias("fac")).collect():
+                                _col(vessels, "length_m").alias("len"), _col(vessels, "is_facility").alias("fac"),
+                                _col(vessels, "fishing_source").alias("fs"), _col(vessels, "vessel_group").alias("grp"),
+                                _col(vessels, "unexpected_reason").alias("why")).collect():
             if r["mmsi"] in seen:
-                # 2 = register, confirmed; 1 = register, call sign only (unconfirmed); 0 = not in the register
-                reg = {"strong": 2, "weak": 1}.get(r["fm"], 0) if in_gold else (1 if norm_call_sign(r["cs"]) in fish else 0)
-                ves[str(r["mmsi"])] = [r["name"], r["st"], r["len"], bool(r["fac"]), reg]
+                ves[str(r["mmsi"])] = [r["name"], r["st"], r["len"], bool(r["fac"]), r["fs"], r["grp"], r["why"]]
     return {
         "t0": t0, "end": end, "buckets": [b[1] for b in BUCKETS],
         "inst": [[n, names[n][0], names[n][1], None, None, None] for n in order],
@@ -373,7 +277,9 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=No
         "zn": {"i": [idx[r["inst_name"]] for r in zr], "m": [r["mmsi"] for r in zr], "t": [hrs(r["entry_ts"]) for r in zr],
                "d": [round(r["minutes_inside"] or 0, 1) for r in zr],
                "kn": [None if r["kn"] is None else round(r["kn"], 1) for r in zr],
-               "x": [None if r["min_dist_m"] is None else int(r["min_dist_m"]) for r in zr]},
+               "x": [None if r["min_dist_m"] is None else int(r["min_dist_m"]) for r in zr],
+               "f": [int(bool(r["fast"])) for r in zr], "r": [RISK.get(r["rl"]) for r in zr], "rw": [r["rw"] for r in zr],
+               "u": [int(bool(r["u"])) for r in zr], "b": [r["b"] for r in zr]},
         "ev": {"k": [1 if r["event_type"] == "ais_gap" else 0 for r in er], "i": [idx[r["inst_name"]] for r in er],
                "m": [r["mmsi"] for r in er], "t": [hrs(r["start_ts"]) for r in er],
                "d": [int(round(r["duration_min"] or 0)) for r in er],
@@ -388,47 +294,34 @@ def summarise(visits, hourly, zones=None, events=None, vessels=None, landings=No
 
 
 def build(visits, hourly, manifest, out_dir, fac=None, zones=None, events=None, vessels=None, installations=None,
-          rules=None, landings=None, coverage=None, min_fraction=0.5, fishing_call_signs=None, pipeline_loiter=None,
-          pipelines_csv=None, sar_csv=None, dark_inst_m=5000, dark_pipe_m=2000, quality_dir=None, metrics_dir=None,
-          gold_dir=None, reference=None, flush_seconds=120):
-    gaps, outage = None, None
-    if coverage is not None:
-        from spark.gold_logic import covered_hours
-        span = hourly.agg(F.min("hour_ts"), F.max("hour_ts")).collect()[0]
-        if span[0] is not None:
-            start = span[0].replace(hour=0, minute=0, second=0, microsecond=0)
-            gaps = standby_gaps(hourly, coverage, min_fraction, start, span[1])
-            ok = covered_hours(coverage, min_fraction, span[1]).select("_h")
-            hours = coverage.select("hour_ts")
-            outage = [r["hour_ts"] for r in hours.join(ok, hours["hour_ts"] == ok["_h"], "left_anti")
-                                                 .where(F.col("hour_ts") >= F.lit(start)).collect()]
+          rules=None, landings=None, coverage=None, pipeline_loiter=None, pipelines_csv=None, standby=None,
+          outages=None, dark=None, quality_dir=None, metrics_dir=None, gold_dir=None, reference=None, flush_seconds=120):
+    """Puts published Gold tables into the page. No rule is applied here: every flag, class, risk, gap and
+    match is a Gold column or table (spark/gold_logic.py); this only selects, encodes and filters to the window."""
+    gaps = standby                                                    # Gold standby_gaps
+    outage = [r["hour_ts"] for r in outages.collect()] if outages is not None else None   # Gold feed_outage_hours
     pl = (pipeline_loiter.select("mmsi", "start_ts", "duration_min", "pipeline_name", "medium", "min_dist_m", "avg_sog_kn",
                                  "lat", "lon").collect() if pipeline_loiter is not None else [])
-    data = summarise(visits, hourly, zones, events, vessels, landings, gaps, outage, fishing_call_signs,
-                     extra_mmsi={r["mmsi"] for r in pl})
+    data = summarise(visits, hourly, zones, events, vessels, landings, gaps, outage, extra_mmsi={r["mmsi"] for r in pl})
     if data is None:
         return None
-    data["fishing_register"] = fishing_call_signs is not None
+    data["fishing_register"] = bool((manifest.get("fishing_register") or {}).get("loaded"))
     t0 = data["t0"]
     hrs = lambda ts: int((ts - t0).total_seconds() // 3600)
     data["pl"] = {"m": [r["mmsi"] for r in pl], "t": [hrs(r["start_ts"]) for r in pl], "d": [int(round(r["duration_min"])) for r in pl],
                   "p": [r["pipeline_name"] for r in pl], "md": [r["medium"] for r in pl], "x": [int(round(r["min_dist_m"])) for r in pl],
                   "kn": [round(r["avg_sog_kn"] or 0, 1) for r in pl], "lat": [round(r["lat"], 4) for r in pl], "lon": [round(r["lon"], 4) for r in pl]}
-    lines, segs = pipeline_lines(pipelines_csv)
+    lines, _ = pipeline_lines(pipelines_csv)
     data["pp"] = lines
-    dets, meta = read_sar(sar_csv)
-    if dets is not None and fac is not None:
-        offshore = [(r["inst_name"], r["i_lat"], r["i_lon"]) for r in fac.select("inst_name", "i_lat", "i_lon", "is_onshore").collect()
-                    if not r["is_onshore"] and r["i_lat"] is not None and r["i_lon"] is not None
-                    and math.isfinite(r["i_lat"]) and math.isfinite(r["i_lon"])]
+    radar = manifest.get("radar")
+    if dark is not None and radar:                                   # Gold dark_detections, near infrastructure only
         first = t0.date().isoformat()
-        near = dark_near_infrastructure([d for d in dets if d["date"] >= first], offshore, segs, dark_inst_m, dark_pipe_m)
+        near = [r for r in dark.collect() if r["date"] >= first]
         day = lambda s_: (datetime.fromisoformat(s_) - t0).days
         data["dk"] = {"t": [day(d["date"]) * 24 for d in near], "lat": [d["lat"] for d in near], "lon": [d["lon"] for d in near],
-                      "n": [d["n"] for d in near], "i": [d["inst"] for d in near], "im": [d["inst_m"] for d in near],
-                      "p": [d["pipe"] for d in near], "pm": [d["pipe_m"] for d in near]}
-        data["dk_meta"] = {**meta, "cells": len(dets), "newest": max((d["date"] for d in dets), default=None),
-                           "inst_m": dark_inst_m, "pipe_m": dark_pipe_m}
+                      "n": [d["detections"] for d in near], "i": [d["inst_name"] for d in near], "im": [d["inst_m"] for d in near],
+                      "p": [d["pipeline"] for d in near], "pm": [d["pipe_m"] for d in near]}
+        data["dk_meta"] = radar
     pos = {}
     if fac is not None:                              # positions from the Sodir reference file
         pos = {r["inst_name"]: (r["i_lat"], r["i_lon"], None) for r in fac.select("inst_name", "i_lat", "i_lon").collect()}
@@ -467,17 +360,16 @@ def build_from_gold(spark, gold, manifest, out_dir, cfg, fac=None):
     from spark.gold_plan import has_data
     read = lambda t: spark.read.parquet(os.path.join(gold, t)) if has_data(os.path.join(gold, t)) else None
     loiter, gaps = read("loitering_events"), read("ais_gap_events")
+    zones = read("safety_zone_entries")                 # zone entries with Gold's safety assessment
+    zones = read("zone_entries") if zones is None else zones
     events = loiter if gaps is None else (gaps if loiter is None else loiter.unionByName(gaps, allowMissingColumns=True))
     return build(read("vessel_visits"), read("installation_activity_hourly"), manifest, out_dir, fac=fac,
-                 zones=read("zone_entries"), events=events, vessels=read("vessels"),
+                 zones=zones, events=events, vessels=read("vessels"),
                  installations=read("installations"), rules=rules_from_config(cfg), landings=read("helicopter_landings"),
-                 coverage=read("feed_coverage_hourly"), min_fraction=cfg.get("surveillance", {}).get("coverage_min_fraction", 0.5),
-                 fishing_call_signs=load_fishing_call_signs(os.path.join(gold, "..", "bronze", "reference", "fishing_vessels.csv")),
+                 coverage=read("feed_coverage_hourly"), standby=read("standby_gaps"), outages=read("feed_outage_hours"),
+                 dark=read("dark_detections"),
                  pipeline_loiter=read("pipeline_loitering"),
                  pipelines_csv=os.path.join(gold, "..", "bronze", "reference", "pipelines.csv"),
-                 sar_csv=os.path.join(gold, "..", "bronze", "gfw", "sar_detections.csv"),
-                 dark_inst_m=cfg.get("surveillance", {}).get("dark_inst_m", 5000),
-                 dark_pipe_m=cfg.get("surveillance", {}).get("dark_pipe_m", 2000),
                  quality_dir=os.path.join(gold, "..", "quality"), metrics_dir=cfg.get("metrics_dir"), gold_dir=gold,
                  reference=reference_files(gold, cfg), flush_seconds=int(cfg.get("flush_seconds", 120)))
 
@@ -925,47 +817,23 @@ function focus(mapId, name){ const M = maps[mapId]; const m = M && M.markers[nam
 
 // ---------- Safety zones and emergency preparedness ----------
 const HL = D.hl || {i:[], t:[], d:[]}, GP = D.gp || {i:[], t:[], n:[]}, OUT = new Set(D.out || []);
-const RESCUE = /\b(FRB|FRC|MOB|DC\d*|DAUGHTER)\b/;
 const vlen = m => VES[m] && VES[m][2] ? VES[m][2] : null;
-const isRescue = m => RESCUE.test(((VES[m] && VES[m][0]) || '').toUpperCase()) || (VES[m] && VES[m][1] === 51 && (vlen(m) == null || vlen(m) < 24));
-function risk(r){                            // [level 0 high .. 2 low, label, reason]
-  const L = vlen(r.m), kn = r.kn;
-  if (isRescue(r.m)) return [2, 'Low', 'rescue craft, built for these speeds'];
-  if (L == null) return [1, 'Medium', 'length unknown at ' + kn.toFixed(1) + ' kn'];
-  if (L < 24) return [2, 'Low', L + ' m: small craft'];
-  if (L >= 80) return [0, 'High', L + ' m at ' + kn.toFixed(1) + ' kn: large and fast'];
-  return kn > 15 ? [0, 'High', L + ' m at ' + kn.toFixed(1) + ' kn: mid-size and very fast'] : [1, 'Medium', L + ' m at ' + kn.toFixed(1) + ' kn: mid-size'];
-}
-const fishReg = m => !!(VES[m] && VES[m][4]), fishAis = m => !!(VES[m] && VES[m][1] === 30), isFishing = m => fishReg(m) || fishAis(m);
-const FLEET = (() => {                       // zone entries per vessel at offshore installations over the whole data period
-  const n = new Map(), inst = new Map(), served = new Map();   // served: vessel -> installation -> days with >= 1 h inside
-  for (let k = 0; k < Z.t.length; k++) { if (I[Z.i[k]][2]) continue; const m = Z.m[k];
-    n.set(m, (n.get(m) || 0) + 1); if (!inst.has(m)) inst.set(m, new Set()); inst.get(m).add(Z.i[k]);
-    if (Z.d[k] >= 60) { if (!served.has(m)) served.set(m, new Map()); const s = served.get(m);
-      if (!s.has(Z.i[k])) s.set(Z.i[k], new Set()); s.get(Z.i[k]).add(Math.floor(Z.t[k] / 24)); } }
-  const repeat = m => [...(served.get(m) || new Map()).values()].some(days => days.size >= 2);
-  const near = new Map(), mins = new Map();  // visits and minutes within 5 km of offshore installations
-  for (let k = 0; k < V.t.length; k++) if (!I[V.i[k]][2]) {
-    near.set(V.m[k], (near.get(V.m[k]) || 0) + 1); mins.set(V.m[k], (mins.get(V.m[k]) || 0) + (V.d[k] || 0)); }
-  const STANDBY_MIN = 48 * 60;               // two days near installations: a standby or field vessel at work
-  return {n, inst, near, mins, has: m => (inst.get(m) || new Set()).size >= 2 || (n.get(m) || 0) >= 5 ||
-                                         (near.get(m) || 0) >= 10 || (mins.get(m) || 0) >= STANDBY_MIN || repeat(m)};
-})();
-const fishSource = m => fishReg(m) ? (VES[m][4] === 1 ? 'fishing register, call sign only' : 'fishing register') : fishAis(m) ? 'AIS type fishing' : '';
-const unexpectedWhy = m => isFishing(m) ? 'fishing vessel (' + fishSource(m) + ')'
-  : 'rarely near installations: ' + (FLEET.n.get(m) || 0) + ' zone entries at ' + (FLEET.inst.get(m) || new Set()).size +
-    ' installation(s), ' + (FLEET.near.get(m) || 0) + ' visits and ' + dur(FLEET.mins.get(m) || 0) + ' within 5 km in all data';
+// Every classification comes from Gold (spark/gold_logic.classify_vessels, assess_zone_entries); the page only shows it.
+// VES[m] = [name, ship type, length, is_facility, fishing_source, vessel_group, unexpected_reason]
+const isFishing = m => !!(VES[m] && VES[m][4]), fishSource = m => (VES[m] && VES[m][4]) || '';
+const group = m => (VES[m] && VES[m][5]) || 'rarely near installations';
+const unexpectedWhy = m => (VES[m] && VES[m][6]) || 'not in the vessel list';
+const RISK_L = ['High', 'Medium', 'Low'];
 function zoneRows(filterMmsi){
   const rows = [];
   for (let k = 0; k < Z.t.length; k++) {
     if (!inRange(Z.t[k])) continue; const ii = Z.i[k];
     if (filterMmsi != null ? Z.m[k] !== filterMmsi : !keep(I[ii][2])) continue;
-    rows.push({ii, inst:I[ii][0], on:I[ii][2], m:Z.m[k], t:Z.t[k], d:Z.d[k], kn:Z.kn[k], x:Z.x[k]});
+    rows.push({ii, inst:I[ii][0], on:I[ii][2], m:Z.m[k], t:Z.t[k], d:Z.d[k], kn:Z.kn[k], x:Z.x[k],
+               fast:!!(Z.f && Z.f[k]), rl:Z.r ? Z.r[k] : null, rw:Z.rw ? Z.rw[k] : null, u:!!(Z.u && Z.u[k]), before:Z.b ? Z.b[k] : null});
   }
   return rows;
 }
-function earlierEntries(){                         // per vessel+installation: entry hours, to count earlier entries
-  const m = new Map(); for (let k = 0; k < Z.t.length; k++) { const key = Z.m[k] + '|' + Z.i[k]; if (!m.has(key)) m.set(key, []); m.get(key).push(Z.t[k]); } return m; }
 function preparedness(){
   const a = from * 24, b = (to + 1) * 24, per = new Map();
   let known = 0; for (let h = a; h < b && h < (END - T0) / HOUR + 1; h++) if (!OUT.has(h)) known++;
@@ -983,10 +851,8 @@ function safety(){
   $('sq').value = sel == null ? '' : I[sel][0]; $('sclear').hidden = sel == null;
   document.querySelectorAll('.rv').forEach(e => e.textContent = R[e.dataset.r]);
   const all = zoneRows(null), rows = sel == null ? all : all.filter(r => r.ii === sel), per = new Map();
-  const isFast = r => r.kn != null && r.kn > R.fast_kn, fast = rows.filter(isFast).map(r => ({...r, risk: risk(r)}));
-  const prior = earlierEntries();
-  const unexp = rows.filter(r => !r.on && !isRescue(r.m) && !isFac(r.m) && (isFishing(r.m) || !FLEET.has(r.m)))
-                    .map(r => ({...r, before: prior.get(r.m + '|' + r.ii).filter(t => t < r.t).length}));
+  const isFast = r => r.fast, fast = rows.filter(isFast).map(r => ({...r, risk: [r.rl ?? 1, RISK_L[r.rl ?? 1], r.rw || '']}));
+  const unexp = rows.filter(r => r.u);                       // Gold: safety_zone_entries.is_unexpected
   const fishVisits = [];
   for (let k = 0; k < V.t.length; k++) { const ii = V.i[k];
     if (!inRange(V.t[k]) || I[ii][2] || !isFishing(V.m[k]) || (sel != null && ii !== sel)) continue;
@@ -1117,7 +983,6 @@ function surveillance(){
     fit(M, pts); }
   gfwAttribution('attrS');
   table('tSurv', rows, evCols(true), r => focus('mapS', r.inst));
-  const group = m => isFishing(m) ? 'fishing vessel' : isRescue(m) ? 'rescue craft' : FLEET.has(m) ? 'offshore fleet' : 'rarely near installations';
   $('notePL').textContent = 'Vessels under ' + R.loiter_max_kn + ' kn within 500 m of an in-service pipeline for at least ' + dur(R.loiter_min_minutes) +
     ', at least 5 km from any installation; live data, from 10-minute track positions. Longest first; click a row to see it on the map.' +
     (PP.length ? '' : ' The pipeline list is not loaded yet.');

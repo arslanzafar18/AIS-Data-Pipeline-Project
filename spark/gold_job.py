@@ -1,10 +1,17 @@
 """
 Gold job: builds consumer tables from Silver and PUBLISHES THEM ONLY IF QUALITY CHECKS PASS.
 
-  gold/vessel_visits                 one row per vessel visit to an installation        (partitioned by arrival day)
+  gold/vessel_visits                 one row per vessel visit to an installation, with wait_min and alongside_min
+                                                                                        (partitioned by arrival day)
   gold/installation_activity_hourly  vessels / messages / speed per installation-hour   (partitioned by day)
   gold/vessel_days                   one row per vessel per day, from all positions     (partitioned by day)
-  gold/vessels                       one row per vessel: latest identity, first/last seen, fishing-register match
+  gold/vessels                       one row per vessel: latest identity, first/last seen, fishing-register match,
+                                     rescue craft, offshore fleet, vessel group, unexpected_in_zone (+ reason)
+  gold/safety_zone_entries           every zone entry with earlier_entries, is_fast, risk_level/reason, is_unexpected
+  gold/standby_gaps                  runs of hours with no vessel within 5 km of an offshore installation
+  gold/feed_outage_hours             hours with under coverage_min_fraction of the median message volume
+  gold/dark_detections               radar detections without AIS near installations (5 km) or pipelines (2 km)
+                                     (rebuilt whole every run: the vessel classification changes as history grows)
   gold/installations                 one row per installation in the facility filter, with field and position
   gold/zone_entries                  one row per entry into a 500 m safety zone                (by entry day)
   gold/loitering_events              slow (< loiter_max_kn) within 5 km for >= loiter_min_minutes (by start day)
@@ -47,14 +54,18 @@ from spark import gold_plan as plan
 from spark.gold_logic import (build_ais_gaps, build_coverage, build_hourly, build_installations, build_loitering,
                               build_vessel_days, build_vessels, build_visits, build_zone_entries, covered_hours,
                               build_vessel_tracks, conform_installations, duplicate_keys, with_position_flags, flag_censored, flag_facility, flag_ordinary, flag_outage, flag_regular,
-                              mark_worth_a_look, match_fishing_register, no_fishing_register)
+                              mark_worth_a_look, match_fishing_register, no_fishing_register,
+                              visit_zone_times, classify_vessels, assess_zone_entries,
+                              standby_gaps, feed_outage_hours, dark_near_infrastructure,
+                              STANDBY_SCHEMA, OUTAGE_SCHEMA, DARK_SCHEMA)
 from spark.session import get_spark
 
 PARTITIONED = ("vessel_visits", "installation_activity_hourly", "vessel_days",
                "zone_entries", "loitering_events", "ais_gap_events", "feed_coverage_hourly", "vessel_tracks", "helicopter_landings")
-LAYOUT = "dt-partitioned-v8"      # bump when tables are added or change shape: the next run is then a full rebuild
+LAYOUT = "dt-partitioned-v9"      # bump when tables are added or change shape: the next run is then a full rebuild
 REBUILT_FROM_OPEN_VISITS = {"vessel_visits": "arrival_ts", "zone_entries": "entry_ts", "loitering_events": "start_ts"}
-DIMENSIONS = ("vessels", "installations")
+DIMENSIONS = ("vessels", "installations", "safety_zone_entries",          # rebuilt whole every run
+              "standby_gaps", "feed_outage_hours", "dark_detections")
 KEYS = {"vessel_visits": ["mmsi", "inst_name", "arrival_ts"], "installation_activity_hourly": ["inst_name", "hour_ts"],
         "vessel_days": ["mmsi", "dt"], "vessel_tracks": ["mmsi", "slot_ts"], "zone_entries": ["mmsi", "inst_name", "entry_ts"],
         "loitering_events": ["mmsi", "inst_name", "start_ts"], "ais_gap_events": ["mmsi", "end_ts"],
@@ -105,6 +116,55 @@ def kept_published(spark, path, ts_col, open_visits, v_day, s_day):
     pub = pub.where((F.col("dt") >= F.lit(v_day)) & (F.col("dt") < F.lit(s_day)))
     return (pub.join(F.broadcast(open_visits), ["mmsi", "inst_name"], "left")
                .where(F.col("open_from").isNull() | (F.col(ts_col) < F.col("open_from"))).drop("open_from"))
+
+
+def whole_window_tables(spark, cfg, P, stage, manifest, hourly, coverage, newest, window_start):
+    """Tables over the whole published window, rebuilt every run because each depends on all of it: standby gaps
+    (hours without a vessel near an offshore installation), feed outage hours, and radar detections without AIS near
+    installations and pipelines. A failure here writes an empty table and a warning: it never blocks Gold."""
+    sc = cfg.get("surveillance", {})
+    min_frac = sc.get("coverage_min_fraction", 0.5)
+    hourly_pub = read_table(spark, P("gold/installation_activity_hourly"))
+    hourly_pub = hourly if hourly_pub is None else hourly_pub
+    cov_pub = read_table(spark, P("gold/feed_coverage_hourly"))
+    cov_pub = coverage if cov_pub is None else cov_pub
+
+    def write(name, build, schema):
+        try:
+            df = build()
+        except Exception as e:      # optional output: log it, publish an empty table, carry on
+            manifest.setdefault("warnings", []).append(f"{name} not built: {e!r}"[:300])
+            df = None
+        (df if df is not None else spark.createDataFrame([], schema)).write.mode("overwrite").parquet(f"{stage}/{name}")
+
+    def gaps():
+        span = hourly_pub.agg(F.min("hour_ts"), F.max("hour_ts")).collect()[0]
+        if span[0] is None:
+            return None
+        start = span[0].replace(hour=0, minute=0, second=0, microsecond=0)
+        return standby_gaps(hourly_pub, cov_pub, min_frac, start, span[1])
+    write("standby_gaps", gaps, STANDBY_SCHEMA)
+    write("feed_outage_hours", lambda: feed_outage_hours(cov_pub, min_frac, newest), OUTAGE_SCHEMA)
+
+    def dark():
+        sar, seg_path, fac_path = P("bronze/gfw/sar_detections.csv"), P("bronze/reference/pipelines.csv"), P("bronze/reference/facilities.csv")
+        if not os.path.exists(sar) or not os.path.exists(fac_path):
+            return None
+        from spark.common import load_facilities
+        from spark.gold_pipelines import segments_df
+        det = spark.read.option("header", True).csv(sar).where(F.col("date") >= F.lit(str(window_start))).cache()
+        meta = det.agg(F.count("*").alias("cells"), F.max("date").alias("newest"), F.max("fetched_at").alias("accessed"),
+                       F.collect_set("dataset").alias("versions")).collect()[0]
+        inst_m, pipe_m = sc.get("dark_inst_m", 5000), sc.get("dark_pipe_m", 2000)
+        manifest["radar"] = {"cells": meta["cells"], "newest": meta["newest"], "accessed": meta["accessed"],
+                             "versions": sorted(meta["versions"] or []), "inst_m": inst_m, "pipe_m": pipe_m}
+        inst = (load_facilities(spark, cfg, fac_path)
+                .where("NOT is_onshore AND i_lat IS NOT NULL AND i_lon IS NOT NULL AND NOT isnan(i_lat) AND NOT isnan(i_lon)"))
+        seg = (segments_df(spark, seg_path, sc.get("pipeline_phases", ["IN SERVICE"])) if os.path.exists(seg_path)
+               else spark.createDataFrame([], "pipeline_id string, name string, label string, medium string, phase string, "
+                                              "seg_no string, lon1 double, lat1 double, lon2 double, lat2 double"))
+        return dark_near_infrastructure(det, inst, seg, inst_m, pipe_m)
+    write("dark_detections", dark, DARK_SCHEMA)
 
 
 def log_run(P, manifest):
@@ -204,11 +264,7 @@ def main(full=False):
                      .dropDuplicates(["mmsi", "event_ts"]))
         near_v = near.unionByName(early, allowMissingColumns=True).cache()
 
-    visits_new = build_visits(near_v, cfg["visit_gap_s"]).withColumn("dt", F.to_date("arrival_ts")).cache()
-    visits = visits_new
-    if v_day < s_day:   # older days = published visits minus the rebuilt open ones, plus their rebuilt versions
-        visits = union_kept(visits_new, kept_published(spark, P("gold/vessel_visits"), "arrival_ts",
-                                                       open_visits, v_day, s_day)).cache()
+    visits_new = build_visits(near_v, cfg["visit_gap_s"]).withColumn("dt", F.to_date("arrival_ts"))   # + zone times below
     hourly = build_hourly(near).withColumn("dt", F.to_date("hour_ts")).cache()
     vdays = build_vessel_days(read).cache()
     coverage = build_coverage(read).cache()
@@ -220,6 +276,11 @@ def main(full=False):
     gap_min_s, gap_max_s = int(sc.get("ais_gap_min_minutes", 30) * 60), int(sc.get("ais_gap_max_hours", 12) * 3600)
     s_start_ts = f"{s_day} 00:00:00"
     zones_new = build_zone_entries(near_v, zone_gap).withColumn("dt", F.to_date("entry_ts")).cache()
+    visits_new = visit_zone_times(visits_new, zones_new).cache()      # waiting and alongside minutes per visit
+    visits = visits_new
+    if v_day < s_day:   # older days = published visits minus the rebuilt open ones, plus their rebuilt versions
+        visits = union_kept(visits_new, kept_published(spark, P("gold/vessel_visits"), "arrival_ts",
+                                                       open_visits, v_day, s_day)).cache()
     loiter_new = build_loitering(near_v, cfg["visit_gap_s"], sc.get("loiter_max_kn", 2.0), sc.get("loiter_min_minutes", 120))
     cols = [c for c in ("mmsi", "event_ts", "is_near_installation", "inst_name", "inst_kind", "is_onshore", "dist_m",
                         "name", "shipType", "shipLength", "speedOverGround") if c in read.columns]
@@ -408,10 +469,23 @@ def main(full=False):
         vessels = match_fishing_register(vessels, reg, sc.get("fishing_length_tol_m", 3.0))
     else:
         vessels = no_fishing_register(vessels)
+    # safety classification over everything published (partitions were swapped above): fleet, rescue craft, fishing
+    zones_pub = read_table(spark, P("gold/zone_entries"))
+    zones_pub = zones if zones_pub is None else zones_pub
+    visits_pub = read_table(spark, P("gold/vessel_visits"))
+    visits_pub = visits if visits_pub is None else visits_pub
+    vessels = classify_vessels(vessels, zones_pub, visits_pub, cfg.get("offshore_fleet"))
     vessels.write.mode("overwrite").parquet(f"{stage}/vessels")
-    fm = {r["fishing_match"]: r["count"] for r in spark.read.parquet(f"{stage}/vessels").groupBy("fishing_match").count().collect()}
+    ves_staged = spark.read.parquet(f"{stage}/vessels")
+    fm = {r["fishing_match"]: r["count"] for r in ves_staged.groupBy("fishing_match").count().collect()}
     manifest["fishing_register"] = {"loaded": os.path.exists(reg_path), "strong": fm.get("strong", 0), "weak": fm.get("weak", 0)}
+    assess_zone_entries(zones_pub, ves_staged, sc.get("zone_fast_kn", 10)).write.mode("overwrite").parquet(f"{stage}/safety_zone_entries")
+    sz = spark.read.parquet(f"{stage}/safety_zone_entries").agg(
+        F.count("*").alias("n"), F.sum(F.col("is_unexpected").cast("int")).alias("unexpected"),
+        F.sum((F.col("risk_level") == "high").cast("int")).alias("high_risk")).collect()[0]
+    manifest["safety"] = {"zone_entries": sz["n"], "unexpected": sz["unexpected"] or 0, "high_risk_fast": sz["high_risk"] or 0}
     inst_dim.write.mode("overwrite").parquet(f"{stage}/installations")
+    whole_window_tables(spark, cfg, P, stage, manifest, hourly, coverage, newest, window_start)
     for t in DIMENSIONS:
         plan.swap_dir(f"{stage}/{t}", P(f"gold/{t}"))
     shutil.rmtree(P("gold/_staging"), ignore_errors=True)

@@ -349,3 +349,196 @@ def build_vessel_tracks(pos: DataFrame, slot_s: int) -> DataFrame:
     cols += [F.col(c) for c in ("inst_name", "dist_m", "is_at_installation") if c in pos.columns]
     return (pos.groupBy("mmsi", slot.alias("slot_ts")).agg(F.max_by(F.struct(*cols), F.col("event_ts")).alias("p"))
                .select("mmsi", "slot_ts", "p.*").withColumn("dt", F.to_date("slot_ts")))
+
+
+# ---- rules the dashboard used to compute: now Gold columns, so every consumer sees the same answer -----------------
+
+def visit_zone_times(visits: DataFrame, zones: DataFrame) -> DataFrame:
+    """Adds to each visit wait_min (from arrival within the near radius to its first 500 m zone entry) and alongside_min
+    (minutes inside the zone in total). Zone entries are matched to the visit of the same vessel and installation that
+    contains them; a visit that never entered the zone gets nulls. Rows are neither added nor dropped."""
+    if zones is None:
+        return visits.withColumn("wait_min", F.lit(None).cast("double")).withColumn("alongside_min", F.lit(None).cast("double"))
+    v = visits.select("mmsi", "inst_name", "arrival_ts",
+                      (F.col("departure_ts") if "departure_ts" in visits.columns
+                       else (F.col("arrival_ts").cast("long") + F.col("duration_min") * 60).cast("timestamp")).alias("_dep")).alias("v")
+    z = zones.select("mmsi", "inst_name", "entry_ts", "minutes_inside").alias("z")
+    hit = (v.join(z, (F.col("v.mmsi") == F.col("z.mmsi")) & (F.col("v.inst_name") == F.col("z.inst_name"))
+                  & F.col("z.entry_ts").between(F.col("v.arrival_ts"), F.col("v._dep")))
+            .groupBy(F.col("v.mmsi").alias("mmsi"), F.col("v.inst_name").alias("inst_name"), F.col("v.arrival_ts").alias("arrival_ts"))
+            .agg(F.min("z.entry_ts").alias("_first"), F.sum("z.minutes_inside").alias("alongside_min")))
+    out = visits.drop("wait_min", "alongside_min").join(hit, ["mmsi", "inst_name", "arrival_ts"], "left")
+    return (out.withColumn("wait_min", (F.col("_first").cast("long") - F.col("arrival_ts").cast("long")) / 60.0)
+               .withColumn("alongside_min", F.col("alongside_min").cast("double")).drop("_first"))
+
+
+RESCUE_NAME = r"\b(FRB|FRC|MOB|DC\d*|DAUGHTER)\b"   # fast rescue boats and daughter craft launched from standby vessels
+FLEET_RULE = {"min_installations": 2, "min_zone_entries": 5, "min_visits": 10, "min_minutes_near": 48 * 60,
+              "served_minutes": 60, "served_days": 2}
+
+
+def _offshore(df):
+    return ~F.coalesce(F.col("is_onshore").cast("boolean"), F.lit(False)) if "is_onshore" in df.columns else F.lit(True)
+
+
+def fleet_stats(zones: DataFrame, visits: DataFrame, rule=None) -> DataFrame:
+    """Per vessel, at OFFSHORE installations over all published days: zone entries, installations entered, visits,
+    minutes within the near radius, and whether it served one installation (>= served_minutes inside) on
+    served_days different days. is_offshore_fleet = any threshold reached: a supply, standby or service vessel that
+    belongs there, judged by what it does rather than by its self-reported AIS ship type."""
+    r = {**FLEET_RULE, **(rule or {})}
+    zo = zones.where(_offshore(zones))
+    z = zo.groupBy("mmsi").agg(F.count("*").alias("fleet_zone_entries"), F.countDistinct("inst_name").alias("fleet_installations"))
+    served = (zo.where(F.col("minutes_inside") >= r["served_minutes"])
+                .groupBy("mmsi", "inst_name").agg(F.countDistinct(F.to_date("entry_ts")).alias("_days"))
+                .groupBy("mmsi").agg((F.max("_days") >= r["served_days"]).alias("fleet_served_repeatedly")))
+    vo = visits.where(_offshore(visits))
+    v = vo.groupBy("mmsi").agg(F.count("*").alias("fleet_visits"), F.sum("duration_min").alias("fleet_minutes_near"))
+    out = z.join(served, "mmsi", "full").join(v, "mmsi", "full")
+    for c in ("fleet_zone_entries", "fleet_installations", "fleet_visits"):
+        out = out.withColumn(c, F.coalesce(F.col(c), F.lit(0)).cast("long"))
+    out = (out.withColumn("fleet_minutes_near", F.coalesce(F.col("fleet_minutes_near"), F.lit(0.0)).cast("double"))
+              .withColumn("fleet_served_repeatedly", F.coalesce(F.col("fleet_served_repeatedly"), F.lit(False))))
+    return out.withColumn("is_offshore_fleet",
+                          (F.col("fleet_installations") >= r["min_installations"]) | (F.col("fleet_zone_entries") >= r["min_zone_entries"])
+                          | (F.col("fleet_visits") >= r["min_visits"]) | (F.col("fleet_minutes_near") >= r["min_minutes_near"])
+                          | F.col("fleet_served_repeatedly"))
+
+
+def classify_vessels(vessels: DataFrame, zones: DataFrame, visits: DataFrame, rule=None) -> DataFrame:
+    """Adds to the vessels table the safety classification every consumer uses:
+      is_rescue_craft   name with FRB / FRC / MOB / DC<n> / DAUGHTER, or AIS type 51 (search and rescue) under 24 m
+      is_fishing        in the fishing register (fishing_match strong or weak) or AIS type 30
+      fishing_source    'fishing register' | 'fishing register, call sign only' | 'AIS type fishing' | null
+      is_offshore_fleet + the fleet_* counts behind it (fleet_stats)
+      vessel_group      fishing vessel > rescue craft > offshore fleet > rarely near installations (first that applies)
+      unexpected_in_zone  not rescue craft, not an installation itself, and either fishing or not in the offshore fleet
+      unexpected_reason   why, in words, for the Safety tab
+    One row out per vessel in."""
+    def col(c, t):
+        return F.col(c) if c in vessels.columns else F.lit(None).cast(t)
+    st, length = col("ship_type", "int"), col("length_m", "double")
+    fm = col("fishing_match", "string")
+    stats = fleet_stats(zones, visits, rule) if zones is not None and visits is not None else None
+    v = vessels.drop(*[c for c in ("is_rescue_craft", "is_fishing", "fishing_source", "is_offshore_fleet", "vessel_group",
+                                   "unexpected_in_zone", "unexpected_reason", "fleet_zone_entries", "fleet_installations",
+                                   "fleet_visits", "fleet_minutes_near", "fleet_served_repeatedly") if c in vessels.columns])
+    if stats is not None:
+        v = v.join(stats, "mmsi", "left")
+    else:
+        v = (v.withColumn("fleet_zone_entries", F.lit(None).cast("long")).withColumn("fleet_installations", F.lit(None).cast("long"))
+              .withColumn("fleet_visits", F.lit(None).cast("long")).withColumn("fleet_minutes_near", F.lit(None).cast("double"))
+              .withColumn("fleet_served_repeatedly", F.lit(None).cast("boolean")).withColumn("is_offshore_fleet", F.lit(None).cast("boolean")))
+    for c in ("fleet_zone_entries", "fleet_installations", "fleet_visits"):
+        v = v.withColumn(c, F.coalesce(F.col(c), F.lit(0)).cast("long"))
+    v = (v.withColumn("fleet_minutes_near", F.coalesce(F.col("fleet_minutes_near"), F.lit(0.0)))
+          .withColumn("is_offshore_fleet", F.coalesce(F.col("is_offshore_fleet"), F.lit(False))))
+    name = F.upper(F.coalesce(col("name", "string"), F.lit("")))
+    rescue = name.rlike(RESCUE_NAME) | ((st == 51) & (length.isNull() | (length < 24)))
+    source = (F.when(fm == "strong", "fishing register").when(fm == "weak", "fishing register, call sign only")
+               .when(st == 30, "AIS type fishing"))
+    v = (v.withColumn("is_rescue_craft", F.coalesce(rescue, F.lit(False)))
+          .withColumn("fishing_source", source).withColumn("is_fishing", F.col("fishing_source").isNotNull()))
+    facility = F.coalesce(col("is_facility", "boolean"), F.lit(False))
+    v = (v.withColumn("vessel_group", F.when(F.col("is_fishing"), "fishing vessel").when(F.col("is_rescue_craft"), "rescue craft")
+                                        .when(F.col("is_offshore_fleet"), "offshore fleet").otherwise("rarely near installations"))
+          .withColumn("unexpected_in_zone", ~F.col("is_rescue_craft") & ~facility & (F.col("is_fishing") | ~F.col("is_offshore_fleet"))))
+    hours = F.format_string("%.1f h", F.col("fleet_minutes_near") / 60.0)
+    why = (F.when(~F.col("unexpected_in_zone"), F.lit(None).cast("string"))
+             .when(F.col("is_fishing"), F.concat(F.lit("fishing vessel ("), F.col("fishing_source"), F.lit(")")))
+             .otherwise(F.format_string("rarely near installations: %d zone entries at %d installation(s), %d visits and ",
+                                        F.col("fleet_zone_entries"), F.col("fleet_installations"), F.col("fleet_visits"))))
+    return v.withColumn("unexpected_reason", F.when(F.col("is_fishing") | ~F.col("unexpected_in_zone"), why)
+                                              .otherwise(F.concat(why, hours, F.lit(" within 5 km in all data"))))
+
+
+def assess_zone_entries(zones: DataFrame, vessels: DataFrame, fast_kn: float = 10.0) -> DataFrame:
+    """Every zone entry with its safety assessment (rebuilt over the whole window each run, because the vessel
+    classification behind it changes as history grows):
+      earlier_entries  entries by the same vessel at the same installation before this one
+      is_fast          top speed inside 500 m above fast_kn
+      risk_level       for fast entries: 'high' | 'medium' | 'low', from length and speed (impact energy grows with
+                       mass and the square of speed): rescue craft and boats under 24 m low, unknown length medium,
+                       80 m or longer high, 24-80 m high above 15 kn else medium
+      risk_reason      why, in words
+      is_unexpected    at an offshore installation, by a vessel with unexpected_in_zone
+    One row out per zone entry in."""
+    ves = vessels.select("mmsi", F.col("length_m").cast("double").alias("_len"), F.col("is_rescue_craft").alias("_rescue"),
+                         F.col("unexpected_in_zone").alias("_unexp"))
+    z = zones.join(ves, "mmsi", "left")
+    w = Window.partitionBy("mmsi", "inst_name").orderBy("entry_ts")
+    kn, L = F.col("max_sog_kn"), F.col("_len")
+    fast = F.coalesce(kn > F.lit(float(fast_kn)), F.lit(False))
+    level = (F.when(~fast, F.lit(None).cast("string")).when(F.coalesce(F.col("_rescue"), F.lit(False)), "low")
+              .when(L.isNull() | (L <= 0), "medium").when(L < 24, "low").when(L >= 80, "high").when(kn > 15, "high").otherwise("medium"))
+    reason = (F.when(~fast, F.lit(None).cast("string"))
+               .when(F.coalesce(F.col("_rescue"), F.lit(False)), F.lit("rescue craft, built for these speeds"))
+               .when(L.isNull() | (L <= 0), F.format_string("length unknown at %.1f kn", kn))
+               .when(L < 24, F.format_string("%d m: small craft", L.cast("int")))
+               .when(L >= 80, F.format_string("%d m at %.1f kn: large and fast", L.cast("int"), kn))
+               .when(kn > 15, F.format_string("%d m at %.1f kn: mid-size and very fast", L.cast("int"), kn))
+               .otherwise(F.format_string("%d m at %.1f kn: mid-size", L.cast("int"), kn)))
+    return (z.withColumn("earlier_entries", (F.row_number().over(w) - 1).cast("int"))
+             .withColumn("is_fast", fast).withColumn("risk_level", level).withColumn("risk_reason", reason)
+             .withColumn("is_unexpected", _offshore(z) & F.coalesce(F.col("_unexp"), F.lit(True)))
+             .drop("_len", "_rescue", "_unexp"))
+
+
+# ---- whole-window tables the dashboard used to build itself (rebuilt every run) ----------------------------------
+
+STANDBY_SCHEMA = "inst_name string, start_ts timestamp, hours long"
+OUTAGE_SCHEMA = "hour_ts timestamp"
+DARK_SCHEMA = ("date string, lat double, lon double, detections long, inst_name string, inst_m int, "
+               "pipeline string, pipe_m int")
+
+
+def standby_gaps(hourly: DataFrame, coverage: DataFrame, min_fraction: float, start, end) -> DataFrame:
+    """Runs of consecutive hours in which no vessel was within the near radius of an OFFSHORE installation, counting only
+    hours the feed covered (an hour under min_fraction of the median message volume is unknown and splits a run).
+    One row per run: inst_name, start hour, hours. Preparedness: how long an installation had no vessel nearby."""
+    off = hourly.where(_offshore(hourly))
+    grid = (off.select("inst_name").distinct()
+               .withColumn("hour_ts", F.explode(F.sequence(F.lit(start), F.lit(end), F.expr("INTERVAL 1 HOUR")))))
+    ok = covered_hours(coverage, min_fraction, end).select(F.col("_h").alias("hour_ts"))
+    present = off.select("inst_name", F.date_trunc("hour", "hour_ts").alias("hour_ts")).distinct().withColumn("_p", F.lit(True))
+    empty = (grid.join(F.broadcast(ok), "hour_ts").join(present, ["inst_name", "hour_ts"], "left").where(F.col("_p").isNull())
+                 .withColumn("_i", (F.col("hour_ts").cast("long") / 3600).cast("long")))
+    run = F.col("_i") - F.row_number().over(Window.partitionBy("inst_name").orderBy("_i"))
+    return (empty.withColumn("_run", run).groupBy("inst_name", "_run")
+                 .agg(F.min("hour_ts").alias("start_ts"), F.count("*").alias("hours")).drop("_run"))
+
+
+def feed_outage_hours(coverage: DataFrame, min_fraction: float, latest_ts) -> DataFrame:
+    """Hours of the whole feed with under min_fraction of the median hourly message volume (the current hour never
+    counts): when nothing arrives, every vessel looks silent, so these hours explain gaps instead of flagging them."""
+    ok = covered_hours(coverage, min_fraction, latest_ts).select(F.col("_h").alias("hour_ts"))
+    return coverage.select("hour_ts").distinct().join(ok, "hour_ts", "left_anti")
+
+
+def dark_near_infrastructure(det: DataFrame, inst: DataFrame, seg: DataFrame, inst_m: float, pipe_m: float) -> DataFrame:
+    """Global Fishing Watch radar detections without AIS (date, lat, lon, detections; one row per day and ~1 km cell)
+    within inst_m of an offshore installation (inst: inst_name, i_lat, i_lon) or pipe_m of a pipeline segment
+    (seg: spark.gold_pipelines.segments_df), each with the nearest of both. Installations: a cheap box test, then the
+    haversine distance (147 rows, broadcast); pipelines: the same grid join as pipeline loitering."""
+    from spark.gold_pipelines import CELL_DEG, haversine_m, point_segment_m, segment_cells
+    key = ["date", "lat", "lon"]
+    d = det.select(F.col("date").cast("string").alias("date"), F.col("lat").cast("double").alias("lat"),
+                   F.col("lon").cast("double").alias("lon"), F.col("detections").cast("long").alias("detections"))
+    dlat = inst_m / 111320.0 * 1.05
+    dlon = dlat / 0.30                       # cos(72 deg), as in Silver's nearest-installation join
+    ii = (d.select(*key).crossJoin(F.broadcast(inst.select("inst_name", "i_lat", "i_lon")))
+           .where((F.abs(F.col("lat") - F.col("i_lat")) < dlat) & (F.abs(F.col("lon") - F.col("i_lon")) < dlon))
+           .withColumn("_m", haversine_m(F.col("lat"), F.col("lon"), F.col("i_lat"), F.col("i_lon")))
+           .where(F.col("_m") <= inst_m))
+    ni = (ii.withColumn("_r", F.row_number().over(Window.partitionBy(*key).orderBy("_m"))).where("_r = 1")
+            .select(*key, "inst_name", F.round("_m").cast("int").alias("inst_m")))
+    cells = (d.select(*key).withColumn("cy", F.floor(F.col("lat") / CELL_DEG).cast("int"))
+              .withColumn("cx", F.floor(F.col("lon") / CELL_DEG).cast("int")))
+    pp = (cells.join(F.broadcast(segment_cells(seg, pipe_m)), ["cy", "cx"])
+               .withColumn("_m", point_segment_m(F.col("lat"), F.col("lon"), F.col("lat1"), F.col("lon1"), F.col("lat2"), F.col("lon2")))
+               .where(F.col("_m") <= pipe_m))
+    npipe = (pp.withColumn("_r", F.row_number().over(Window.partitionBy(*key).orderBy("_m"))).where("_r = 1")
+               .select(*key, F.coalesce(F.col("name"), F.col("label")).alias("pipeline"), F.round("_m").cast("int").alias("pipe_m")))
+    return (d.join(ni, key, "left").join(npipe, key, "left")
+             .where(F.col("inst_name").isNotNull() | F.col("pipeline").isNotNull())
+             .select("date", "lat", "lon", "detections", "inst_name", "inst_m", "pipeline", "pipe_m"))

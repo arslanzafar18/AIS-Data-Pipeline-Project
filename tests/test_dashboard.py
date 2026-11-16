@@ -56,83 +56,67 @@ def test_dashboard_embeds_zone_entries_events_and_vessels(spark, tmp_path):
     assert data["rules"] == {"min_days": 3}
 
 
-def test_visits_carry_waiting_and_alongside_minutes(spark, tmp_path):
-    from datetime import timedelta
-    visits = spark.createDataFrame(
-        [(1, "PLATFORM", "JACKET 4 LEGS", False, T, 300.0, 1),            # waits 45 min, then two zone entries
-         (2, "PLATFORM", "JACKET 4 LEGS", False, T, 10.0, 0),             # passing: never inside 500 m
-         (1, "PLATFORM", "JACKET 4 LEGS", False, T + timedelta(days=1), 60.0, 1)],   # a later visit by the same ship
-        VISITS)
+def test_visits_show_gold_waiting_and_alongside_minutes(spark, tmp_path):
+    visits = spark.createDataFrame([(1, "PLATFORM", "JACKET 4 LEGS", False, T, 300.0, 1, 45.0, 150.0),
+                                    (2, "PLATFORM", "JACKET 4 LEGS", False, T, 10.0, 0, None, None)],
+                                   VISITS + ", wait_min double, alongside_min double")
     hourly = spark.createDataFrame([("PLATFORM", T, 2, False)], HOURLY)
-    zones = spark.createDataFrame(
-        [(1, "PLATFORM", T + timedelta(minutes=45), 120.0, 3.0, 80.0),
-         (1, "PLATFORM", T + timedelta(minutes=200), 30.0, 2.0, 90.0),
-         (1, "PLATFORM", T + timedelta(days=1, minutes=5), 50.0, 4.0, 60.0)],
-        "mmsi long, inst_name string, entry_ts timestamp, minutes_inside double, max_sog_kn double, min_dist_m double")
-    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path), zones=zones))
-    got = sorted(zip(data["v"]["m"], data["v"]["t"], data["v"]["w"], data["v"]["a"]), key=lambda r: (r[0], r[1]))
-    assert got == [(1, 12, 45, 150), (1, 36, 5, 50), (2, 12, None, None)]
-
-
-def test_standby_gaps_skip_feed_outages_and_onshore(spark):
-    from datetime import timedelta
-    h = lambda n: T + timedelta(hours=n)
-    # PLATFORM has a vessel at hours 0, 1, 5 and 9; TERMINAL (onshore) has none after hour 0
-    hourly = spark.createDataFrame([("PLATFORM", h(n), 1, False) for n in (0, 1, 5, 9)] + [("TERMINAL", h(0), 1, True)], HOURLY)
-    # the feed is normal every hour except hour 3 (outage: 10 messages against a median of 1000)
-    coverage = spark.createDataFrame([(h(n), 10 if n == 3 else 1000, 50) for n in range(10)], "hour_ts timestamp, msgs long, vessels long")
-    gaps = {(r["start_ts"], r["hours"]) for r in dashboard.standby_gaps(hourly, coverage, 0.5, h(0), h(9)).collect()}
-    assert gaps == {(h(2), 1), (h(4), 1), (h(6), 3)}      # hour 3 is unknown, so 2..4 is two gaps, not one of three hours
+    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path)))
+    assert sorted(zip(data["v"]["m"], data["v"]["w"], data["v"]["a"])) == [(1, 45, 150), (2, None, None)]   # read, not computed
 
 
 def test_dashboard_embeds_landings_gaps_and_outages(spark, tmp_path):
     from datetime import timedelta
     visits = spark.createDataFrame([(1, "PLATFORM", "JACKET 4 LEGS", False, T, 60.0, 1)], VISITS)
     hourly = spark.createDataFrame([("PLATFORM", T, 1, False), ("PLATFORM", T + timedelta(hours=4), 1, False)], HOURLY)
-    coverage = spark.createDataFrame([(T + timedelta(hours=n), 5 if n == 2 else 1000, 50) for n in range(5)], "hour_ts timestamp, msgs long, vessels long")
     landings = spark.createDataFrame([("PLATFORM", T + timedelta(hours=1), 12.0)], "inst_name string, arrival_ts timestamp, minutes_in_zone double")
+    standby = spark.createDataFrame([("PLATFORM", T + timedelta(hours=1), 1), ("PLATFORM", T + timedelta(hours=3), 1)],
+                                    "inst_name string, start_ts timestamp, hours long")      # Gold standby_gaps
+    outages = spark.createDataFrame([(T + timedelta(hours=2),)], "hour_ts timestamp")         # Gold feed_outage_hours
     data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path),
-                                 landings=landings, coverage=coverage))
+                                 landings=landings, standby=standby, outages=outages))
     assert data["hl"] == {"i": [0], "t": [13], "d": [12]}
     assert sorted(zip(data["gp"]["t"], data["gp"]["n"])) == [(13, 1), (15, 1)] and data["out"] == [14]
 
 
-def test_fishing_register_is_matched_on_call_sign(spark, tmp_path):
-    reg = tmp_path / "fishing_vessels.csv"
-    reg.write_text("call_sign,name,length_m\nLK-2345,KYSTFISK,18.2\n,NO SIGN,10\n", encoding="utf-8")
-    signs = dashboard.load_fishing_call_signs(str(reg))
-    assert signs == {"LK2345"} and dashboard.load_fishing_call_signs(str(tmp_path / "missing.csv")) is None
-    visits = spark.createDataFrame([(1, "PLATFORM", "JACKET 4 LEGS", False, T, 90.0, 1),
-                                    (2, "PLATFORM", "JACKET 4 LEGS", False, T, 30.0, 0)], VISITS)
+def test_dashboard_shows_the_gold_classification(spark, tmp_path):
+    visits = spark.createDataFrame([(m, "PLATFORM", "JACKET 4 LEGS", False, T, 30.0, 0) for m in (1, 2)], VISITS)
     hourly = spark.createDataFrame([("PLATFORM", T, 2, False)], HOURLY)
-    vessels = spark.createDataFrame([(1, "KYSTFISK", 99, 18, False, "lk 2345"), (2, "SUPPLY", 90, 80, False, "LAXX")],
-                                    "mmsi long, name string, ship_type int, length_m int, is_facility boolean, call_sign string")
-    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path / "out"),
-                                 vessels=vessels, fishing_call_signs=signs))
-    assert data["ves"]["1"][4] == 1 and data["ves"]["2"][4] == 0 and data["fishing_register"] is True
+    vessels = spark.createDataFrame(
+        [(1, "KYSTFISK", 30, 18, False, "fishing register", "fishing vessel", "fishing vessel (fishing register)"),
+         (2, "SUPPLY", 90, 80, False, None, "offshore fleet", None)],
+        "mmsi long, name string, ship_type int, length_m int, is_facility boolean, fishing_source string, "
+        "vessel_group string, unexpected_reason string")
+    zones = spark.createDataFrame([(1, "PLATFORM", T, 20.0, 12.5, 120.0, True, "low", "18 m: small craft", True, 2)],
+                                  "mmsi long, inst_name string, entry_ts timestamp, minutes_inside double, max_sog_kn double, "
+                                  "min_dist_m double, is_fast boolean, risk_level string, risk_reason string, "
+                                  "is_unexpected boolean, earlier_entries int")
+    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00",
+                                                  "fishing_register": {"loaded": True}}, str(tmp_path / "out"),
+                                 vessels=vessels, zones=zones))
+    assert data["ves"]["1"][4:] == ["fishing register", "fishing vessel", "fishing vessel (fishing register)"]
+    assert data["ves"]["2"][4:] == [None, "offshore fleet", None] and data["fishing_register"] is True
+    zn = data["zn"]
+    assert (zn["f"], zn["r"], zn["rw"], zn["u"], zn["b"]) == ([1], [2], ["18 m: small craft"], [1], [2])
 
 
-
-def test_dashboard_reads_the_fishing_match_from_gold(spark, tmp_path):
-    visits = spark.createDataFrame([(m, "PLATFORM", "JACKET 4 LEGS", False, T, 30.0, 0) for m in (1, 2, 3)], VISITS)
-    hourly = spark.createDataFrame([("PLATFORM", T, 3, False)], HOURLY)
-    vessels = spark.createDataFrame([(1, "A", 30, 18, False, "LK1", "strong"), (2, "B", 30, 18, False, "LK2", "weak"),
-                                     (3, "C", 30, 18, False, "LK3", None)],
-                                    "mmsi long, name string, ship_type int, length_m int, is_facility boolean, call_sign string, "
-                                    "fishing_match string")
-    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00"}, str(tmp_path / "out"),
-                                 vessels=vessels, fishing_call_signs={"LK3"}))
-    assert [data["ves"][k][4] for k in ("1", "2", "3")] == [2, 1, 0]    # Gold's match wins over the raw call-sign list
-
-def test_pipeline_lines_and_dark_detections(tmp_path):
+def test_pipeline_lines_for_the_map(tmp_path):
     p = tmp_path / "pipelines.csv"
     p.write_text("pipeline_id,name,label,medium,phase,seg_no,lon1,lat1,lon2,lat2\n"
                  "7,Gas A,GA,Gas,IN SERVICE,0,3.0,60.0,3.1,60.0\n7,Gas A,GA,Gas,IN SERVICE,1,3.1,60.0,3.2,60.1\n"
                  "7,Gas A,GA,Gas,IN SERVICE,2,4.0,61.0,4.1,61.0\n8,Old,OL,Oil,DECOMMISSIONED,0,5.0,60.0,5.1,60.0\n")
     lines, segs = dashboard.pipeline_lines(str(p))
     assert [len(l[2]) for l in lines] == [3, 2] and len(segs) == 3          # the jump starts a new line; old pipe left out
-    dets = [{"date": "d", "lat": 60.004, "lon": 3.05, "n": 1}, {"date": "d", "lat": 60.598, "lon": 3.726, "n": 1},
-            {"date": "d", "lat": 63.0, "lon": 8.0, "n": 1}]
-    near = dashboard.dark_near_infrastructure(dets, [("PLATFORM X", 60.62, 3.726)], segs, 5000, 2000)
-    assert [(r["pipe"], r["pipe_m"], r["inst"]) for r in near] == [("Gas A", 445, None), (None, None, "PLATFORM X")]
-    assert near[1]["inst_m"] == 2446                                         # found across a grid cell edge
+
+
+def test_dashboard_shows_gold_dark_detections(spark, tmp_path):
+    visits = spark.createDataFrame([(1, "PLATFORM", "JACKET 4 LEGS", False, T, 60.0, 1)], VISITS)
+    hourly = spark.createDataFrame([("PLATFORM", T, 1, False)], HOURLY)
+    dark = spark.createDataFrame([("2026-11-04", 60.004, 3.05, 2, None, None, "Gas A", 445),
+                                  ("2026-11-01", 60.6, 3.7, 1, "PLATFORM X", 2446, None, None)],      # before the data: left out
+                                 "date string, lat double, lon double, detections long, inst_name string, inst_m int, "
+                                 "pipeline string, pipe_m int")
+    data = _data(dashboard.build(visits, hourly, {"finished_at": "2026-11-04T13:00:00+00:00", "radar": {"newest": "2026-11-04"}},
+                                 str(tmp_path), dark=dark))
+    assert data["dk"]["p"] == ["Gas A"] and data["dk"]["pm"] == [445] and data["dk"]["n"] == [2] and data["dk"]["t"] == [0]
+    assert data["dk_meta"] == {"newest": "2026-11-04"}
