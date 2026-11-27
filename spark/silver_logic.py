@@ -91,8 +91,10 @@ def validate(s: DataFrame, max_event_age_days: float = 365) -> DataFrame:
     stale_timestamp: stamped more than max_event_age_days before it was ingested, e.g. a transponder reporting a default
     clock date (2013 was seen in production). The historic backfill is weeks old, well inside the limit."""
     lat, lon = F.col("latitude"), F.col("longitude")
+    mmsi_bad = ((F.col("mmsi_class") == "invalid") if "mmsi_class" in s.columns
+                            else (F.col("mmsi").isNull() | (F.col("mmsi") < 100000000) | (F.col("mmsi") > 999999999)))
     reason = (F.when(F.col("parse_failed"), "parse_failed")
-               .when(F.col("mmsi").isNull() | (F.col("mmsi") < 100000000) | (F.col("mmsi") > 999999999), "bad_mmsi")
+               .when(mmsi_bad, "bad_mmsi")
                .when(F.col("event_ts").isNull(), "bad_timestamp")
                .when(lat.isNull() | lon.isNull(), "missing_position")
                .when((lat == 91) | (lon == 181), "sentinel_position")
