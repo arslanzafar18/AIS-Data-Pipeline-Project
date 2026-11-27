@@ -1,0 +1,13 @@
+[Unit]
+Description=Split Silver tables (silver_v2) for the last two days (nightly, run by deploy-silver-v2.timer)
+
+[Service]
+Type=oneshot
+User=@USER@
+Nice=10
+WorkingDirectory=@REPO@
+Environment=PYTHONPATH=@REPO@
+Environment=JAVA_HOME=@JAVA_HOME@
+Environment=PATH=@VENV@/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PYSPARK_SUBMIT_ARGS=--driver-memory 4g pyspark-shell"
+ExecStart=@VENV@/bin/python scripts/build_silver_v2.py --root @REPO@/data/prod --last-days 2
