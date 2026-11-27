@@ -32,9 +32,12 @@ def main():
     ap.add_argument("--root", default=os.path.expanduser("~/AIS-Data-Pipeline-Project/data/prod"),
                     help="data root that holds silver/ and bronze/reference/")
     ap.add_argument("--from-dt")
+    ap.add_argument("--last-days", type=int, help="build the last N days up to --to-dt (used by the daily timer)")
     ap.add_argument("--to-dt", default=(datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d"),
                     help="last day to build (default: yesterday, because today is still being written)")
     a = ap.parse_args()
+    if a.last_days:
+        a.from_dt = (datetime.now(timezone.utc) - timedelta(days=a.last_days)).strftime("%Y-%m-%d")
     src, out = f"{a.root}/silver/positions", f"{a.root}/silver_v2"
     cfg = pipeline_config.load("prod")
     spark = (SparkSession.builder.appName("silver_v2").master("local[2]").config("spark.ui.enabled", "false")

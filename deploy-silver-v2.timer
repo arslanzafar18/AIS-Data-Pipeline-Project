@@ -1,0 +1,10 @@
+[Unit]
+Description=Build the split Silver tables every night
+
+[Timer]
+OnCalendar=*-*-* 04:10:00 UTC
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

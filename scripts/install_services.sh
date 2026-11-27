@@ -20,7 +20,7 @@ if [ -z "${JAVA_HOME:-}" ] && command -v java >/dev/null 2>&1; then
 fi
 JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}
 SERVICES="ais-collector ais-pipeline-loop ais-dashboard jaeger"
-JOBS="sodir-refresh fishing-refresh gfw-refresh bronze-retention"      # oneshot services started by timers
+JOBS="sodir-refresh fishing-refresh gfw-refresh bronze-retention silver-v2"      # oneshot services started by timers
 
 render_all() {   # $1 = output folder
   mkdir -p "$1"
